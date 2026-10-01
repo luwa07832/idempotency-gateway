@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -233,6 +234,130 @@ func TestListInvalidCursorAndExpiredStatus(t *testing.T) {
 	if badLimit.Code != http.StatusBadRequest ||
 		!strings.HasPrefix(badLimit.Body.String(), `{"error":{"code":"invalid_idempotency_record",`) {
 		t.Fatalf("bad limit = %d %s", badLimit.Code, badLimit.Body.String())
+	}
+}
+
+func TestListFiltersByRequestFingerprint(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "service.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	handler := NewRouter(st)
+
+	// Two different keys share one fingerprint and a third uses a distinct one.
+	seed := []struct {
+		key         string
+		fingerprint string
+	}{
+		{"key-a", "fp-shared"},
+		{"key-b", "fp-shared"},
+		{"key-c", "fp-other"},
+	}
+	for _, item := range seed {
+		response := doJSON(t, handler, http.MethodPost, "/v1/idempotency/records",
+			submitBody(item.key, item.fingerprint, `{}`, ""))
+		if response.Code != http.StatusOK {
+			t.Fatalf("seed %s: %d %s", item.key, response.Code, response.Body.String())
+		}
+	}
+
+	// A fourth row shares the fingerprint but is already expired. The API rejects past
+	// expires_at on submit, so it is written straight through the store at a past instant;
+	// the fingerprint filter must never surface it through the API.
+	expiredAt := time.Now().UTC().Add(-2 * time.Hour)
+	expiredID, err := store.NewRecordID()
+	if err != nil {
+		t.Fatalf("new id: %v", err)
+	}
+	if _, _, err := st.PutRecord(context.Background(), store.Record{
+		ID:                 expiredID,
+		IdempotencyKey:     "key-d",
+		RequestFingerprint: "fp-shared",
+		ResponseSnapshot:   []byte(`{}`),
+		CreatedAt:          expiredAt,
+		ExpiresAt:          expiredAt.Add(time.Hour),
+	}, expiredAt); err != nil {
+		t.Fatalf("seed expired row: %v", err)
+	}
+
+	var list struct {
+		Records []struct {
+			IdempotencyKey     string `json:"idempotency_key"`
+			RequestFingerprint string `json:"request_fingerprint"`
+		} `json:"records"`
+		NextCursor string `json:"next_cursor"`
+	}
+
+	matched := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint=fp-shared", "")
+	if matched.Code != http.StatusOK {
+		t.Fatalf("fingerprint list status = %d %s", matched.Code, matched.Body.String())
+	}
+	if err := json.Unmarshal(matched.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(list.Records) != 2 || list.NextCursor != "" {
+		t.Fatalf("matched = %+v", list)
+	}
+	if list.Records[0].IdempotencyKey != "key-b" || list.Records[1].IdempotencyKey != "key-a" {
+		t.Fatalf("matched order = %+v", list.Records)
+	}
+
+	// Exact, character-for-character matching: no case folding or prefix matching.
+	for _, raw := range []string{
+		"FP-SHARED",
+		"fp-share",
+		"fp-sharedx",
+		"%20fp-shared",
+		"fp-shared%20",
+	} {
+		response := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint="+raw, "")
+		if response.Body.String() != `{"records":[],"next_cursor":""}` {
+			t.Fatalf("fingerprint %q leaked a match: %s", raw, response.Body.String())
+		}
+	}
+
+	// Empty/absent parameter keeps the baseline behavior; spaces are non-empty and must not
+	// be trimmed into a match-all query.
+	if response := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint=", ""); strings.Count(response.Body.String(), `"idempotency_key"`) != 3 {
+		t.Fatalf("empty fingerprint should apply no filter: %s", response.Body.String())
+	}
+	if response := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint=%20%20", ""); response.Body.String() != `{"records":[],"next_cursor":""}` {
+		t.Fatalf("whitespace fingerprint must stay exact: %s", response.Body.String())
+	}
+
+	// The fingerprint predicate combines with key and with the expired-status empty page.
+	combined := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?key=key-a&request_fingerprint=fp-shared", "")
+	if strings.Count(combined.Body.String(), `"idempotency_key"`) != 1 ||
+		!strings.Contains(combined.Body.String(), "key-a") {
+		t.Fatalf("combined filter = %s", combined.Body.String())
+	}
+	if response := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?key=key-a&request_fingerprint=fp-other", ""); response.Body.String() != `{"records":[],"next_cursor":""}` {
+		t.Fatalf("crossed key/fingerprint should be empty: %s", response.Body.String())
+	}
+	if response := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint=fp-shared&status=expired", ""); response.Body.String() != `{"records":[],"next_cursor":""}` {
+		t.Fatalf("expired status must stay empty with fingerprint: %s", response.Body.String())
+	}
+
+	// Pagination under the fingerprint filter stays transparent: the second page resumes after
+	// the cursor without repeating or dropping rows.
+	page1 := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint=fp-shared&limit=1", "")
+	var first struct {
+		Records []struct {
+			IdempotencyKey string `json:"idempotency_key"`
+		} `json:"records"`
+		NextCursor string `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(page1.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode page1: %v", err)
+	}
+	if len(first.Records) != 1 || first.Records[0].IdempotencyKey != "key-b" || first.NextCursor == "" {
+		t.Fatalf("fingerprint page1 = %+v", first)
+	}
+	page2 := doJSON(t, handler, http.MethodGet,
+		"/v1/idempotency/records?request_fingerprint=fp-shared&limit=1&cursor="+first.NextCursor, "")
+	if !strings.Contains(page2.Body.String(), "key-a") || strings.Contains(page2.Body.String(), "key-b") {
+		t.Fatalf("fingerprint page2 = %s", page2.Body.String())
 	}
 }
 

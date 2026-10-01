@@ -217,6 +217,59 @@ func TestListFiltersOrderAndPagination(t *testing.T) {
 	}
 }
 
+func TestListFilterByRequestFingerprint(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+
+	specs := []struct {
+		key         string
+		fingerprint string
+		offset      time.Duration
+		expires     time.Duration
+	}{
+		{"k1", "fp-shared", 0, time.Hour},
+		{"k2", "fp-shared", time.Minute, time.Hour},
+		{"k3", "fp-other", 2 * time.Minute, time.Hour},
+		{"gone", "fp-shared", 3 * time.Minute, -2 * time.Hour},
+	}
+	for _, spec := range specs {
+		at := base.Add(spec.offset)
+		record := makeRecord(t, spec.key, spec.fingerprint, `"snap"`, at, at.Add(spec.expires))
+		if _, _, err := st.PutRecord(ctx, record, at); err != nil {
+			t.Fatalf("put %s: %v", spec.key, err)
+		}
+	}
+	now := base.Add(10 * time.Minute)
+
+	matched, err := st.ListRecords(ctx, ListFilter{RequestFingerprint: "fp-shared", Limit: 10}, now)
+	if err != nil {
+		t.Fatalf("list by fingerprint: %v", err)
+	}
+	if len(matched) != 2 {
+		t.Fatalf("matched len = %d, want 2 (expired row excluded)", len(matched))
+	}
+	if matched[0].IdempotencyKey != "k2" || matched[1].IdempotencyKey != "k1" {
+		t.Fatalf("matched order = %v, want k2 then k1", []string{matched[0].IdempotencyKey, matched[1].IdempotencyKey})
+	}
+
+	for _, fp := range []string{"FP-SHARED", "fp-share", "fp-sharedx"} {
+		rows, err := st.ListRecords(ctx, ListFilter{RequestFingerprint: fp, Limit: 10}, now)
+		if err != nil || len(rows) != 0 {
+			t.Fatalf("fingerprint %q: rows=%v err=%v", fp, rows, err)
+		}
+	}
+
+	combined, err := st.ListRecords(ctx, ListFilter{IdempotencyKey: "k1", RequestFingerprint: "fp-shared", Limit: 10}, now)
+	if err != nil || len(combined) != 1 || combined[0].IdempotencyKey != "k1" {
+		t.Fatalf("combined filter: rows=%v err=%v", combined, err)
+	}
+	crossed, err := st.ListRecords(ctx, ListFilter{IdempotencyKey: "k1", RequestFingerprint: "fp-other", Limit: 10}, now)
+	if err != nil || len(crossed) != 0 {
+		t.Fatalf("crossed filter: rows=%v err=%v", crossed, err)
+	}
+}
+
 func TestConcurrentPutsElectSingleFirstRecord(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

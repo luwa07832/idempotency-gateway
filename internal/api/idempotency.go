@@ -228,6 +228,9 @@ func handleListRecords(c *gin.Context, st *store.Store) {
 	if key := strings.TrimSpace(c.Query("key")); key != "" {
 		filter.IdempotencyKey = key
 	}
+	// The fingerprint is matched byte-for-byte: no trimming, case folding or any other
+	// normalization is applied, and an empty/absent value applies no filter at all.
+	filter.RequestFingerprint = c.Query("request_fingerprint")
 
 	switch strings.TrimSpace(c.Query("status")) {
 	case "", "active":
