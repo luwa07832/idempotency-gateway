@@ -7,6 +7,11 @@
 - Go 1.26 或以上
 - SQLite（本服务自带存储，不需要外部数据库）
 
+多个服务实例可以把 `DB_PATH` 指向同一个数据库文件组成并发部署。写入事务以
+`BEGIN IMMEDIATE` 开始并配合 WAL 与 `busy_timeout`：SQLite 在同一时刻只向一个连接授予
+RESERVED 锁，其他实例在锁上等待，因此跨进程的“先查后插”不会交错，实例内则由串行写锁
+负责同样的顺序。并发启动时建表语句若遇到瞬时 `SQLITE_BUSY` 会短暂重试，不影响启动。
+
 ## 构建、测试与启动
 
 ```bash
@@ -84,3 +89,17 @@ go run .
 ## 错误约定
 
 所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。指纹冲突结果同样以顶层 `error` 呈现，并在其后固定附带 `record_id` 与 `request_fingerprint`。存储不可用时所有幂等入口返回 HTTP 503，`code` 为 `storage_unavailable`。
+
+## 多实例并发语义
+
+多个实例共享一个数据库文件并发提交同一 `idempotency_key` 时：
+
+- 请求指纹相同：所有成功请求都返回 HTTP 200、相同的 `record.id`、逐字节一致的首次
+  `response_snapshot` 与相同的时间字段，最终只有一条未过期记录可见。
+- 请求指纹不同：只有最先提交成功的请求返回 HTTP 200，其余返回 HTTP 409，顶层
+  `error.code` 为 `idempotency_fingerprint_conflict`，并固定回传获胜记录的 `record_id`
+  与 `request_fingerprint`；后到请求不会覆盖首次快照。
+- 记录过期后并发重提：只新增一条记录，获胜记录之后的请求回放它；新旧行都保留在底层历史
+  表中，不删除、不改写、不合并，查询与列表始终只暴露未过期记录。
+- 锁等待超过 `busy_timeout`、数据库无法读写或提交结果无法确认时，相关入口返回 HTTP 503，
+  `code` 为 `storage_unavailable`，错误信息不泄露 SQL 细节。
