@@ -49,7 +49,10 @@ func NewRecordID() (string, error) {
 // PutRecord stores the candidate unless an active (non-expired) record already owns the same
 // idempotency key at now. With an existing active record the outcome is PutReplayed when the
 // fingerprints match and PutConflict otherwise; in both cases the returned record is the stored
-// one and the candidate is not written. Writes are serialized so the first writer wins.
+// one and the candidate is not written. The existence check and the insert run inside a single
+// BEGIN IMMEDIATE transaction (see sqliteDSN), so the first writer to commit wins and concurrent
+// service instances sharing the same database file observe that committed row instead of
+// inserting a second visible record.
 func (s *Store) PutRecord(ctx context.Context, candidate Record, now time.Time) (*Record, PutOutcome, error) {
 	nowNS := now.UnixNano()
 

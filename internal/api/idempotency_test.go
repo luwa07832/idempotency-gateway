@@ -3,10 +3,12 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -267,5 +269,138 @@ func TestSubmitRejectsExpiryNotStrictlyAfterNow(t *testing.T) {
 	}
 	if string(validated.responseSnapshot) != `{"v":1}` || !validated.expiresAt.Equal(now.Add(time.Second)) {
 		t.Fatalf("validated request = %+v", validated)
+	}
+}
+
+// newSharedRouters returns two HTTP handlers backed by two Store instances opened on the
+// same database file, simulating a multi-instance deployment on one DB_PATH.
+func newSharedRouters(t *testing.T) []http.Handler {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "shared.db")
+	handlers := make([]http.Handler, 0, 2)
+	for i := 0; i < 2; i++ {
+		st, err := store.Open(path)
+		if err != nil {
+			t.Fatalf("open instance %d: %v", i, err)
+		}
+		t.Cleanup(func() { st.Close() })
+		handlers = append(handlers, NewRouter(st))
+	}
+	return handlers
+}
+
+func TestSharedFileConcurrentSubmitsReturnIdenticalRecord(t *testing.T) {
+	handlers := newSharedRouters(t)
+
+	const clients = 16
+	codes := make([]int, clients)
+	bodies := make([]string, clients)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < clients; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			request := httptest.NewRequest(http.MethodPost, "/v1/idempotency/records",
+				bytes.NewBufferString(submitBody("shared", "fp", `{"price":100}`, "")))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			handlers[i%len(handlers)].ServeHTTP(recorder, request)
+			codes[i], bodies[i] = recorder.Code, recorder.Body.String()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := range codes {
+		if codes[i] != http.StatusOK {
+			t.Fatalf("client %d status = %d body = %s", i, codes[i], bodies[i])
+		}
+		if bodies[i] != bodies[0] {
+			t.Fatalf("client %d body = %s, want identical replay %s", i, bodies[i], bodies[0])
+		}
+	}
+
+	list := doJSON(t, handlers[0], http.MethodGet, "/v1/idempotency/records?key=shared", "")
+	if got := strings.Count(list.Body.String(), `"idempotency_key"`); got != 1 {
+		t.Fatalf("list shows %d records, want exactly 1: %s", got, list.Body.String())
+	}
+}
+
+func TestSharedFileConcurrentFingerprintConflict(t *testing.T) {
+	handlers := newSharedRouters(t)
+
+	const clients = 16
+	codes := make([]int, clients)
+	bodies := make([]string, clients)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < clients; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			snapshot := fmt.Sprintf(`{"n":%d}`, i)
+			request := httptest.NewRequest(http.MethodPost, "/v1/idempotency/records",
+				bytes.NewBufferString(submitBody("shared-conflict", fmt.Sprintf("fp-%d", i), snapshot, "")))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			handlers[i%len(handlers)].ServeHTTP(recorder, request)
+			codes[i], bodies[i] = recorder.Code, recorder.Body.String()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	winnerBody := ""
+	winnerID := ""
+	winnerFingerprint := ""
+	for i := range codes {
+		switch codes[i] {
+		case http.StatusOK:
+			if winnerBody != "" {
+				t.Fatalf("client %d also returned 200; only one submission may win", i)
+			}
+			winnerBody = bodies[i]
+			var parsed struct {
+				Record struct {
+					ID                 string `json:"id"`
+					RequestFingerprint string `json:"request_fingerprint"`
+				} `json:"record"`
+			}
+			if err := json.Unmarshal([]byte(bodies[i]), &parsed); err != nil {
+				t.Fatalf("decode winner: %v", err)
+			}
+			winnerID = parsed.Record.ID
+			winnerFingerprint = parsed.Record.RequestFingerprint
+		case http.StatusConflict:
+			if !strings.HasPrefix(bodies[i], `{"error":{"code":"idempotency_fingerprint_conflict",`) {
+				t.Fatalf("client %d conflict body shape: %s", i, bodies[i])
+			}
+		default:
+			t.Fatalf("client %d status = %d body = %s", i, codes[i], bodies[i])
+		}
+	}
+	if winnerBody == "" {
+		t.Fatalf("no submission won")
+	}
+	for i := range codes {
+		if codes[i] != http.StatusConflict {
+			continue
+		}
+		if !strings.Contains(bodies[i], `"record_id":"`+winnerID+`"`) ||
+			!strings.Contains(bodies[i], `"request_fingerprint":"`+winnerFingerprint+`"`) {
+			t.Fatalf("client %d conflict body does not report the winner: %s", i, bodies[i])
+		}
+	}
+
+	lookup := doJSON(t, handlers[1], http.MethodGet, "/v1/idempotency/records/shared-conflict", "")
+	if lookup.Code != http.StatusOK || lookup.Body.String() != winnerBody {
+		t.Fatalf("first snapshot not preserved: %d %s, want %s", lookup.Code, lookup.Body.String(), winnerBody)
+	}
+	list := doJSON(t, handlers[1], http.MethodGet, "/v1/idempotency/records?key=shared-conflict", "")
+	if got := strings.Count(list.Body.String(), `"idempotency_key"`); got != 1 {
+		t.Fatalf("list shows %d records, want exactly 1: %s", got, list.Body.String())
 	}
 }

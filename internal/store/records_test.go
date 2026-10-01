@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -257,5 +258,187 @@ func TestConcurrentPutsElectSingleFirstRecord(t *testing.T) {
 	}
 	if createdCount != 1 {
 		t.Fatalf("created count = %d, want exactly 1", createdCount)
+	}
+}
+
+// openSharedInstance opens another Store on the same file, simulating a second service
+// instance deployed against the same DB_PATH.
+func openSharedInstance(t *testing.T, path string) *Store {
+	t.Helper()
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("open shared instance: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return st
+}
+
+func countStoredRows(t *testing.T, st *Store, key string) int {
+	t.Helper()
+	var count int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM idempotency_records WHERE idempotency_key = ?`, key).Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	return count
+}
+
+// racePuts runs every candidate concurrently against alternating instances of the same
+// database file and collects per-writer results.
+func racePuts(t *testing.T, stores []*Store, candidates []Record, now time.Time) ([]*Record, []PutOutcome, []error) {
+	t.Helper()
+	ctx := context.Background()
+	start := make(chan struct{})
+	results := make([]*Record, len(candidates))
+	outcomes := make([]PutOutcome, len(candidates))
+	errs := make([]error, len(candidates))
+	var wg sync.WaitGroup
+	for i := range candidates {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			saved, outcome, err := stores[i%len(stores)].PutRecord(ctx, candidates[i], now)
+			results[i], outcomes[i], errs[i] = saved, outcome, err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	return results, outcomes, errs
+}
+
+func TestSharedFileConcurrentPutsElectSingleRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shared.db")
+	instances := []*Store{openSharedInstance(t, path), openSharedInstance(t, path)}
+	created := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+
+	const writers = 24
+	candidates := make([]Record, writers)
+	for i := range candidates {
+		candidates[i] = makeRecord(t, "shared-key", "fp-shared", `{"v":1}`, created, created.Add(time.Hour))
+	}
+	results, outcomes, errs := racePuts(t, instances, candidates, created)
+
+	createdCount := 0
+	for i := range candidates {
+		if errs[i] != nil {
+			t.Fatalf("writer %d: %v", i, errs[i])
+		}
+		if outcomes[i] == PutCreated {
+			createdCount++
+		}
+		if results[i].ID != results[0].ID {
+			t.Fatalf("writer %d saw id %s, want shared winner %s", i, results[i].ID, results[0].ID)
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created count = %d, want exactly 1 across instances", createdCount)
+	}
+	if rows := countStoredRows(t, instances[0], "shared-key"); rows != 1 {
+		t.Fatalf("stored rows = %d, want exactly 1 visible record", rows)
+	}
+}
+
+func TestSharedFileConcurrentConflictsKeepFirstRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shared.db")
+	instances := []*Store{openSharedInstance(t, path), openSharedInstance(t, path)}
+	ctx := context.Background()
+	created := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+
+	const writers = 24
+	candidates := make([]Record, writers)
+	for i := range candidates {
+		snapshot := fmt.Sprintf(`{"v":%d}`, i)
+		candidates[i] = makeRecord(t, "conflict-key", fmt.Sprintf("fp-%d", i), snapshot, created, created.Add(time.Hour))
+	}
+	results, outcomes, errs := racePuts(t, instances, candidates, created)
+
+	winnerIndex := -1
+	for i := range candidates {
+		if errs[i] != nil {
+			t.Fatalf("writer %d: %v", i, errs[i])
+		}
+		if outcomes[i] == PutCreated {
+			if winnerIndex != -1 {
+				t.Fatalf("both writer %d and writer %d created a record", winnerIndex, i)
+			}
+			winnerIndex = i
+			continue
+		}
+		if outcomes[i] != PutConflict {
+			t.Fatalf("writer %d outcome = %d, want PutConflict", i, outcomes[i])
+		}
+	}
+	if winnerIndex == -1 {
+		t.Fatalf("no writer created the record")
+	}
+	winner := candidates[winnerIndex]
+	for i := range candidates {
+		if results[i].ID != winner.ID || results[i].RequestFingerprint != winner.RequestFingerprint {
+			t.Fatalf("writer %d saw %+v, want winner id %s fingerprint %s",
+				i, results[i], winner.ID, winner.RequestFingerprint)
+		}
+	}
+	if rows := countStoredRows(t, instances[1], "conflict-key"); rows != 1 {
+		t.Fatalf("stored rows = %d, want exactly 1 visible record", rows)
+	}
+	lookup, err := instances[1].ActiveRecordByKey(ctx, "conflict-key", created)
+	if err != nil || lookup == nil {
+		t.Fatalf("lookup: record=%v err=%v", lookup, err)
+	}
+	if string(lookup.ResponseSnapshot) != string(winner.ResponseSnapshot) {
+		t.Fatalf("first snapshot overwritten: got %s, want %s", lookup.ResponseSnapshot, winner.ResponseSnapshot)
+	}
+}
+
+func TestSharedFileResubmitAfterExpiryAddsSingleRow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shared.db")
+	instances := []*Store{openSharedInstance(t, path), openSharedInstance(t, path)}
+	ctx := context.Background()
+	firstAt := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+
+	first := makeRecord(t, "renew-key", "fp", `{"v":"old"}`, firstAt, firstAt.Add(time.Hour))
+	if _, outcome, err := instances[0].PutRecord(ctx, first, firstAt); err != nil || outcome != PutCreated {
+		t.Fatalf("seed put: outcome=%d err=%v", outcome, err)
+	}
+
+	secondAt := firstAt.Add(2 * time.Hour)
+	const writers = 16
+	candidates := make([]Record, writers)
+	for i := range candidates {
+		candidates[i] = makeRecord(t, "renew-key", "fp", `{"v":"new"}`, secondAt, secondAt.Add(time.Hour))
+	}
+	results, outcomes, errs := racePuts(t, instances, candidates, secondAt)
+
+	createdCount := 0
+	for i := range candidates {
+		if errs[i] != nil {
+			t.Fatalf("writer %d: %v", i, errs[i])
+		}
+		if outcomes[i] == PutCreated {
+			createdCount++
+		}
+		if results[i].ID != results[0].ID {
+			t.Fatalf("writer %d saw id %s, want shared winner %s", i, results[i].ID, results[0].ID)
+		}
+		if results[i].ID == first.ID {
+			t.Fatalf("writer %d reused the expired record id", i)
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created count = %d, want exactly 1 across instances", createdCount)
+	}
+	if rows := countStoredRows(t, instances[0], "renew-key"); rows != 2 {
+		t.Fatalf("stored rows = %d, want the expired row plus exactly 1 new row", rows)
+	}
+	lookup, err := instances[1].ActiveRecordByKey(ctx, "renew-key", secondAt)
+	if err != nil || lookup == nil || lookup.ID != results[0].ID {
+		t.Fatalf("lookup after concurrent renew: record=%v err=%v", lookup, err)
+	}
+	if string(lookup.ResponseSnapshot) != `{"v":"new"}` {
+		t.Fatalf("lookup snapshot = %s, want the new snapshot", lookup.ResponseSnapshot)
+	}
+	listed, err := instances[1].ListRecords(ctx, ListFilter{Limit: 100}, secondAt)
+	if err != nil || len(listed) != 1 || listed[0].ID != results[0].ID {
+		t.Fatalf("list after concurrent renew: rows=%v err=%v", listed, err)
 	}
 }

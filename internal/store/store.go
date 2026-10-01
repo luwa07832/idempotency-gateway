@@ -4,6 +4,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -13,14 +14,17 @@ import (
 type Store struct {
 	db *sql.DB
 
-	// writeMu serializes the check-then-insert flow in PutRecord so concurrent first requests
-	// for the same idempotency key cannot both observe "missing" and insert competing rows.
+	// writeMu serializes the check-then-insert flow in PutRecord within this process. Across
+	// processes sharing the same database file, serialization comes from the write transaction
+	// itself: every PutRecord runs inside BEGIN IMMEDIATE (see sqliteDSN), so SQLite holds the
+	// database write lock from the existence check until commit and a concurrent instance
+	// either waits out the winner within busy_timeout or fails with storage_unavailable.
 	writeMu sync.Mutex
 }
 
 // Open prepares the database file and the schema this service needs.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -28,15 +32,32 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("enable wal: %w", err)
 	}
-	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("set busy timeout: %w", err)
-	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
 	return &Store{db: db}, nil
+}
+
+// sqliteDSN turns a plain file path into the driver DSN shared by every pooled connection.
+// busy_timeout must be a DSN pragma because a one-off PRAGMA would only cover the single
+// connection it ran on; _txlock=immediate makes every write transaction start with BEGIN
+// IMMEDIATE, which is what makes the check-then-insert in PutRecord atomic across all
+// service instances sharing this file: a concurrent BEGIN IMMEDIATE in another process
+// waits up to busy_timeout for the current writer to commit, then observes its row.
+func sqliteDSN(path string) string {
+	const params = "_pragma=busy_timeout(5000)&_txlock=immediate"
+	if strings.HasPrefix(path, "file:") {
+		separator := "?"
+		if strings.Contains(path, "?") {
+			separator = "&"
+		}
+		return path + separator + params
+	}
+	// Percent-encode the characters that would otherwise be mistaken for the query
+	// string delimiter or corrupt the URI.
+	escaped := strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23").Replace(path)
+	return "file:" + escaped + "?" + params
 }
 
 // Ping reports whether the storage layer is usable.
