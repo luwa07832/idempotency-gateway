@@ -244,3 +244,28 @@ func TestRepeatedCallsAreByteIdentical(t *testing.T) {
 		t.Fatalf("repeated calls differ:\n%s\n%s", first.Body.String(), second.Body.String())
 	}
 }
+
+func TestSubmitRejectsExpiryNotStrictlyAfterNow(t *testing.T) {
+	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+
+	equal := `{"idempotency_key":"k","request_fingerprint":"fp","response_snapshot":{},"expires_at":"` + now.Format(time.RFC3339Nano) + `"}`
+	if _, message, ok := validateSubmitRequest([]byte(equal), now); ok {
+		t.Fatalf("expiry equal to now accepted")
+	} else if message == "" {
+		t.Fatalf("equal expiry returned no fixed message")
+	}
+
+	past := `{"idempotency_key":"k","request_fingerprint":"fp","response_snapshot":{},"expires_at":"` + now.Add(-time.Second).Format(time.RFC3339Nano) + `"}`
+	if _, _, ok := validateSubmitRequest([]byte(past), now); ok {
+		t.Fatalf("expiry earlier than now accepted")
+	}
+
+	future := `{"idempotency_key":"k","request_fingerprint":"fp","response_snapshot":{"v":1},"expires_at":"` + now.Add(time.Second).Format(time.RFC3339Nano) + `"}`
+	validated, _, ok := validateSubmitRequest([]byte(future), now)
+	if !ok {
+		t.Fatalf("expiry later than now rejected")
+	}
+	if string(validated.responseSnapshot) != `{"v":1}` || !validated.expiresAt.Equal(now.Add(time.Second)) {
+		t.Fatalf("validated request = %+v", validated)
+	}
+}

@@ -36,6 +36,54 @@ type submitRequest struct {
 	ExpiresAt          *string         `json:"expires_at"`
 }
 
+// validatedSubmitRequest carries the normalized fields of an accepted submission.
+type validatedSubmitRequest struct {
+	idempotencyKey     string
+	requestFingerprint string
+	responseSnapshot   json.RawMessage
+	expiresAt          time.Time
+}
+
+// validateSubmitRequest enforces the fixed submission contract. The message return value carries
+// the fixed message for InvalidIdempotencyRequest. Expiry must be strictly later than now: a
+// timestamp equal to the creation moment is already expired and is rejected.
+func validateSubmitRequest(rawBody []byte, now time.Time) (validatedSubmitRequest, string, bool) {
+	var request submitRequest
+	if err := json.Unmarshal(rawBody, &request); err != nil {
+		return validatedSubmitRequest{}, "request body must be a single JSON object", false
+	}
+	if strings.TrimSpace(request.IdempotencyKey) == "" {
+		return validatedSubmitRequest{}, "idempotency_key must not be empty", false
+	}
+	if strings.TrimSpace(request.RequestFingerprint) == "" {
+		return validatedSubmitRequest{}, "request_fingerprint must not be empty", false
+	}
+	if request.ExpiresAt == nil || strings.TrimSpace(*request.ExpiresAt) == "" {
+		return validatedSubmitRequest{}, "expires_at must be provided", false
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*request.ExpiresAt))
+	if err != nil {
+		return validatedSubmitRequest{}, "expires_at must be an RFC 3339 timestamp", false
+	}
+	expiresAt = expiresAt.UTC()
+	if !expiresAt.After(now) {
+		return validatedSubmitRequest{}, "expires_at must be later than the current time", false
+	}
+	snapshot := request.ResponseSnapshot
+	if len(snapshot) == 0 {
+		snapshot = json.RawMessage("null")
+	}
+	if !isValidJSON(snapshot) {
+		return validatedSubmitRequest{}, "response_snapshot must be valid JSON", false
+	}
+	return validatedSubmitRequest{
+		idempotencyKey:     request.IdempotencyKey,
+		requestFingerprint: request.RequestFingerprint,
+		responseSnapshot:   snapshot,
+		expiresAt:          expiresAt,
+	}, "", true
+}
+
 // recordResponse lists its fields in the fixed order every record-shaped result uses.
 type recordResponse struct {
 	ID                 string          `json:"id"`
@@ -115,39 +163,9 @@ func handleSubmit(c *gin.Context, st *store.Store) {
 		writeInvalidRecord(c, "request body must be a single JSON object")
 		return
 	}
-	var request submitRequest
-	if err := json.Unmarshal(rawBody, &request); err != nil {
-		writeInvalidRecord(c, "request body must be a single JSON object")
-		return
-	}
-	if strings.TrimSpace(request.IdempotencyKey) == "" {
-		writeInvalidRecord(c, "idempotency_key must not be empty")
-		return
-	}
-	if strings.TrimSpace(request.RequestFingerprint) == "" {
-		writeInvalidRecord(c, "request_fingerprint must not be empty")
-		return
-	}
-	if request.ExpiresAt == nil || strings.TrimSpace(*request.ExpiresAt) == "" {
-		writeInvalidRecord(c, "expires_at must be provided")
-		return
-	}
-	expiresAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*request.ExpiresAt))
-	if err != nil {
-		writeInvalidRecord(c, "expires_at must be an RFC 3339 timestamp")
-		return
-	}
-	expiresAt = expiresAt.UTC()
-	if expiresAt.Before(now) {
-		writeInvalidRecord(c, "expires_at must not be earlier than created_at")
-		return
-	}
-	snapshot := request.ResponseSnapshot
-	if len(snapshot) == 0 {
-		snapshot = json.RawMessage("null")
-	}
-	if !isValidJSON(snapshot) {
-		writeInvalidRecord(c, "response_snapshot must be valid JSON")
+	validated, message, ok := validateSubmitRequest(rawBody, now)
+	if !ok {
+		writeInvalidRecord(c, message)
 		return
 	}
 
@@ -158,11 +176,11 @@ func handleSubmit(c *gin.Context, st *store.Store) {
 	}
 	candidate := store.Record{
 		ID:                 id,
-		IdempotencyKey:     request.IdempotencyKey,
-		RequestFingerprint: request.RequestFingerprint,
-		ResponseSnapshot:   snapshot,
+		IdempotencyKey:     validated.idempotencyKey,
+		RequestFingerprint: validated.requestFingerprint,
+		ResponseSnapshot:   validated.responseSnapshot,
 		CreatedAt:          now,
-		ExpiresAt:          expiresAt,
+		ExpiresAt:          validated.expiresAt,
 	}
 
 	record, outcome, err := st.PutRecord(c.Request.Context(), candidate, now)
