@@ -23,6 +23,8 @@ func NewRouter(st *store.Store) *gin.Engine {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "database": "ok"})
 	})
 
+	registerIdempotencyRoutes(router, st)
+
 	router.NoRoute(func(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"code": "route_not_found", "message": "no route matches this path"}})
 	})
