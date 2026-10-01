@@ -2,9 +2,11 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -242,6 +244,144 @@ func TestRepeatedCallsAreByteIdentical(t *testing.T) {
 	second := doJSON(t, handler, http.MethodPost, "/v1/idempotency/records", submitBody("stable", "fp", `{"z":9,"a":9}`, ""))
 	if first.Body.String() != second.Body.String() {
 		t.Fatalf("repeated calls differ:\n%s\n%s", first.Body.String(), second.Body.String())
+	}
+}
+
+func TestListFiltersByRequestFingerprint(t *testing.T) {
+	handler := newAPIRouter(t)
+	seeds := []struct {
+		key         string
+		fingerprint string
+	}{
+		{"shared-a", "alpha"},
+		{"shared-b", "alpha"},
+		{"upper", "ALPHA"},
+		{"other", "beta"},
+	}
+	for _, seed := range seeds {
+		response := doJSON(t, handler, http.MethodPost, "/v1/idempotency/records", submitBody(seed.key, seed.fingerprint, `{}`, ""))
+		if response.Code != http.StatusOK {
+			t.Fatalf("seed %s: %d %s", seed.key, response.Code, response.Body.String())
+		}
+	}
+
+	decodeKeys := func(body string) ([]string, string) {
+		var parsed struct {
+			Records []struct {
+				IdempotencyKey string `json:"idempotency_key"`
+			} `json:"records"`
+			NextCursor string `json:"next_cursor"`
+		}
+		if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+			t.Fatalf("decode list body %q: %v", body, err)
+		}
+		keys := make([]string, len(parsed.Records))
+		for i := range parsed.Records {
+			keys[i] = parsed.Records[i].IdempotencyKey
+		}
+		return keys, parsed.NextCursor
+	}
+
+	matched, cursor := decodeKeys(doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint=alpha", "").Body.String())
+	if len(matched) != 2 || matched[0] != "shared-b" || matched[1] != "shared-a" || cursor != "" {
+		t.Fatalf("fingerprint filter = %v cursor=%q, want shared-b, shared-a with no next cursor", matched, cursor)
+	}
+
+	if keys, _ := decodeKeys(doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint=ALPHA", "").Body.String()); len(keys) != 1 || keys[0] != "upper" {
+		t.Fatalf("fingerprint filter must be case-sensitive: %v", keys)
+	}
+
+	if body := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint=alp", "").Body.String(); body != `{"records":[],"next_cursor":""}` {
+		t.Fatalf("fingerprint filter must not prefix-match: %s", body)
+	}
+
+	if body := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint=%20alpha%20", "").Body.String(); body != `{"records":[],"next_cursor":""}` {
+		t.Fatalf("fingerprint filter must keep whitespace verbatim: %s", body)
+	}
+
+	emptyParam := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint=", "")
+	if keys, _ := decodeKeys(emptyParam.Body.String()); len(keys) != 4 {
+		t.Fatalf("empty fingerprint must behave like the baseline: %v", keys)
+	}
+
+	combined := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?key=shared-a&request_fingerprint=alpha", "")
+	if strings.Count(combined.Body.String(), `"idempotency_key"`) != 1 || !strings.Contains(combined.Body.String(), "shared-a") {
+		t.Fatalf("fingerprint+key filter: %s", combined.Body.String())
+	}
+
+	page1 := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint=alpha&limit=1", "")
+	page1Keys, next := decodeKeys(page1.Body.String())
+	if len(page1Keys) != 1 || page1Keys[0] != "shared-b" || next == "" {
+		t.Fatalf("fingerprint page1 = %v cursor=%q", page1Keys, next)
+	}
+	page2 := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint=alpha&limit=1&cursor="+url.QueryEscape(next), "")
+	page2Keys, page2Cursor := decodeKeys(page2.Body.String())
+	if len(page2Keys) != 1 || page2Keys[0] != "shared-a" || page2Cursor != "" {
+		t.Fatalf("fingerprint page2 = %v cursor=%q", page2Keys, page2Cursor)
+	}
+
+	expired := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?status=expired&request_fingerprint=alpha", "")
+	if expired.Code != http.StatusOK || expired.Body.String() != `{"records":[],"next_cursor":""}` {
+		t.Fatalf("expired status with fingerprint = %d %s", expired.Code, expired.Body.String())
+	}
+
+	invalidCases := []struct {
+		target string
+		code   string
+	}{
+		{"/v1/idempotency/records?request_fingerprint=alpha&limit=0", "invalid_idempotency_record"},
+		{"/v1/idempotency/records?request_fingerprint=alpha&status=weird", "invalid_idempotency_record"},
+		{"/v1/idempotency/records?request_fingerprint=alpha&expires_before=not-a-time", "invalid_idempotency_record"},
+		{"/v1/idempotency/records?request_fingerprint=alpha&cursor=not-base64!!", "invalid_cursor"},
+	}
+	for _, tc := range invalidCases {
+		response := doJSON(t, handler, http.MethodGet, tc.target, "")
+		if response.Code != http.StatusBadRequest ||
+			!strings.HasPrefix(response.Body.String(), `{"error":{"code":"`+tc.code+`",`) {
+			t.Fatalf("%s = %d %s", tc.target, response.Code, response.Body.String())
+		}
+	}
+
+	rawFingerprint := `fp space&eq=1`
+	created := doJSON(t, handler, http.MethodPost, "/v1/idempotency/records", submitBody("special", rawFingerprint, `{}`, ""))
+	if created.Code != http.StatusOK {
+		t.Fatalf("seed special fingerprint: %d %s", created.Code, created.Body.String())
+	}
+	special := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint="+url.QueryEscape(rawFingerprint), "")
+	if strings.Count(special.Body.String(), `"idempotency_key"`) != 1 || !strings.Contains(special.Body.String(), "special") {
+		t.Fatalf("special-character fingerprint filter: %s", special.Body.String())
+	}
+}
+
+func TestListFingerprintHidesExpiredRows(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "service.db")
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	now := time.Now().UTC()
+
+	expiredID, err := store.NewRecordID()
+	if err != nil {
+		t.Fatalf("new id: %v", err)
+	}
+	expired := store.Record{
+		ID:                 expiredID,
+		IdempotencyKey:     "gone",
+		RequestFingerprint: "alpha",
+		ResponseSnapshot:   []byte(`"secret"`),
+		CreatedAt:          now.Add(-2 * time.Hour),
+		ExpiresAt:          now.Add(-time.Hour),
+	}
+	if _, _, err := st.PutRecord(context.Background(), expired, now); err != nil {
+		t.Fatalf("seed expired row: %v", err)
+	}
+
+	handler := NewRouter(st)
+	response := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records?request_fingerprint=alpha", "")
+	if response.Code != http.StatusOK || response.Body.String() != `{"records":[],"next_cursor":""}` {
+		t.Fatalf("expired snapshot leaked through fingerprint filter: %d %s", response.Code, response.Body.String())
 	}
 }
 

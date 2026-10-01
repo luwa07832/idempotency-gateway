@@ -217,6 +217,104 @@ func TestListFiltersOrderAndPagination(t *testing.T) {
 	}
 }
 
+func TestListFiltersByExactRequestFingerprint(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+
+	specs := []struct {
+		key         string
+		fingerprint string
+		offset      time.Duration
+		expires     time.Duration
+	}{
+		{"k1", "alpha", 0, time.Hour},
+		{"k2", "alpha", time.Minute, time.Hour},
+		{"k3", "ALPHA", 2 * time.Minute, time.Hour},
+		{"k4", "beta", 3 * time.Minute, time.Hour},
+		{"expired", "alpha", -2 * time.Hour, -time.Hour},
+	}
+	for _, spec := range specs {
+		at := base.Add(spec.offset)
+		record := makeRecord(t, spec.key, spec.fingerprint, `"snap"`, at, at.Add(spec.expires))
+		if _, _, err := st.PutRecord(ctx, record, at); err != nil {
+			t.Fatalf("put %s: %v", spec.key, err)
+		}
+	}
+	now := base.Add(4 * time.Minute)
+
+	rows, err := st.ListRecords(ctx, ListFilter{RequestFingerprint: "alpha", Limit: 10}, now)
+	if err != nil {
+		t.Fatalf("list by fingerprint: %v", err)
+	}
+	if len(rows) != 2 || rows[0].IdempotencyKey != "k2" || rows[1].IdempotencyKey != "k1" {
+		t.Fatalf("fingerprint filter rows = %v, want k2 then k1", rows)
+	}
+
+	upper, err := st.ListRecords(ctx, ListFilter{RequestFingerprint: "ALPHA", Limit: 10}, now)
+	if err != nil || len(upper) != 1 || upper[0].IdempotencyKey != "k3" {
+		t.Fatalf("fingerprint matching must be case-sensitive: rows=%v err=%v", upper, err)
+	}
+
+	missing, err := st.ListRecords(ctx, ListFilter{RequestFingerprint: "alp", Limit: 10}, now)
+	if err != nil || len(missing) != 0 {
+		t.Fatalf("fingerprint matching must not be prefix-based: rows=%v err=%v", missing, err)
+	}
+
+	whitespace, err := st.ListRecords(ctx, ListFilter{RequestFingerprint: "alpha ", Limit: 10}, now)
+	if err != nil || len(whitespace) != 0 {
+		t.Fatalf("fingerprint matching must not trim whitespace: rows=%v err=%v", whitespace, err)
+	}
+
+	combined, err := st.ListRecords(ctx, ListFilter{
+		IdempotencyKey:     "k1",
+		RequestFingerprint: "alpha",
+		Limit:              10,
+	}, now)
+	if err != nil || len(combined) != 1 || combined[0].IdempotencyKey != "k1" {
+		t.Fatalf("fingerprint+key filter: rows=%v err=%v", combined, err)
+	}
+
+	wrongKey, err := st.ListRecords(ctx, ListFilter{
+		IdempotencyKey:     "k4",
+		RequestFingerprint: "alpha",
+		Limit:              10,
+	}, now)
+	if err != nil || len(wrongKey) != 0 {
+		t.Fatalf("fingerprint+key filter leaked another key: rows=%v err=%v", wrongKey, err)
+	}
+}
+
+func TestListFingerprintPaginationTieBreaker(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	created := time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)
+
+	tieRecords := []Record{
+		makeRecord(t, "tie-a", "same", `"snap"`, created, created.Add(time.Hour)),
+		makeRecord(t, "tie-b", "same", `"snap"`, created, created.Add(time.Hour)),
+	}
+	for _, record := range tieRecords {
+		if _, _, err := st.PutRecord(ctx, record, created); err != nil {
+			t.Fatalf("put tie record: %v", err)
+		}
+	}
+
+	page1, err := st.ListRecords(ctx, ListFilter{RequestFingerprint: "same", Limit: 1}, created.Add(time.Minute))
+	if err != nil || len(page1) != 1 {
+		t.Fatalf("tie page1: rows=%v err=%v", page1, err)
+	}
+	page2, err := st.ListRecords(ctx, ListFilter{
+		RequestFingerprint: "same",
+		Limit:              1,
+		CursorCreatedAt:    page1[0].CreatedAt,
+		CursorID:           page1[0].ID,
+	}, created.Add(time.Minute))
+	if err != nil || len(page2) != 1 || page2[0].ID == page1[0].ID {
+		t.Fatalf("tie page2 overlapped page1: rows=%v err=%v", page2, err)
+	}
+}
+
 func TestConcurrentPutsElectSingleFirstRecord(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

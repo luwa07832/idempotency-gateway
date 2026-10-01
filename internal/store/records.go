@@ -107,12 +107,13 @@ func (s *Store) ActiveRecordByKey(ctx context.Context, key string, now time.Time
 
 // ListFilter narrows ListRecords. Zero-valued fields are not applied.
 type ListFilter struct {
-	IdempotencyKey  string
-	ExpiresBefore   *time.Time
-	ExpiresAfter    *time.Time
-	CursorCreatedAt time.Time
-	CursorID        string
-	Limit           int
+	IdempotencyKey     string
+	RequestFingerprint string
+	ExpiresBefore      *time.Time
+	ExpiresAfter       *time.Time
+	CursorCreatedAt    time.Time
+	CursorID           string
+	Limit              int
 }
 
 // ListRecords returns active records matching filter, newest first with id as the deterministic
@@ -129,6 +130,10 @@ WHERE expires_at_ns > ?`
 	if filter.IdempotencyKey != "" {
 		query += ` AND idempotency_key = ?`
 		args = append(args, filter.IdempotencyKey)
+	}
+	if filter.RequestFingerprint != "" {
+		query += ` AND request_fingerprint = ?`
+		args = append(args, filter.RequestFingerprint)
 	}
 	if filter.ExpiresBefore != nil {
 		query += ` AND expires_at_ns < ?`
