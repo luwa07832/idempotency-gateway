@@ -138,8 +138,8 @@ func handleSubmit(c *gin.Context, st *store.Store) {
 		return
 	}
 	expiresAt = expiresAt.UTC()
-	if expiresAt.Before(now) {
-		writeInvalidRecord(c, "expires_at must not be earlier than created_at")
+	if !expiresAt.After(now) {
+		writeInvalidRecord(c, "expires_at must be later than created_at")
 		return
 	}
 	snapshot := request.ResponseSnapshot
