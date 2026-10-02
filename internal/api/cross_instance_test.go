@@ -46,9 +46,10 @@ func TestCrossInstancesHTTPSameFingerprint(t *testing.T) {
 	body := submitBody("race-same", "fp", `{"price":100}`, "")
 
 	type response struct {
-		status int
-		body   string
-		id     string
+		status  int
+		body    string
+		id      string
+		outcome string
 	}
 	responses := make([]response, instances)
 	start := make(chan struct{})
@@ -71,6 +72,10 @@ func TestCrossInstancesHTTPSameFingerprint(t *testing.T) {
 				}
 				_ = json.Unmarshal(recorder.Body.Bytes(), &parsed)
 				result.id = parsed.Record.ID
+				result.outcome = recorder.Header().Get("Idempotency-Outcome")
+				if recordID := recorder.Header().Get("Idempotency-Record-ID"); recordID != result.id {
+					t.Errorf("instance %d record-id header = %q, want %s", i, recordID, result.id)
+				}
 			}
 			responses[i] = result
 		}(i, router)
@@ -80,9 +85,17 @@ func TestCrossInstancesHTTPSameFingerprint(t *testing.T) {
 
 	winnerID := ""
 	winnerBody := ""
+	createdCount := 0
 	for i, result := range responses {
 		if result.status != http.StatusOK {
 			t.Fatalf("instance %d status = %d body = %s", i, result.status, result.body)
+		}
+		switch result.outcome {
+		case "created":
+			createdCount++
+		case "replayed":
+		default:
+			t.Fatalf("instance %d Idempotency-Outcome = %q", i, result.outcome)
 		}
 		if winnerID == "" {
 			winnerID = result.id
@@ -91,6 +104,9 @@ func TestCrossInstancesHTTPSameFingerprint(t *testing.T) {
 		if result.id != winnerID || result.body != winnerBody {
 			t.Fatalf("instance %d body = %s, want winner %s", i, result.body, winnerBody)
 		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created outcomes = %d, want exactly 1", createdCount)
 	}
 
 	// Exactly one active row is visible, from every instance.

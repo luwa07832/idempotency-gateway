@@ -105,6 +105,24 @@ func (s *Store) ActiveRecordByKey(ctx context.Context, key string, now time.Time
 	return queryActiveRecord(ctx, s.db, key, now.UnixNano())
 }
 
+// RecordByID returns any record generation with the given id, including expired rows. It is the
+// read-only backing for the records-by-id lookup: the caller decides active versus expired from
+// the record's own expires_at. (nil, nil) means no row carries the id. The method issues no
+// writes and never changes what the active or history endpoints can see.
+func (s *Store) RecordByID(ctx context.Context, id string) (*Record, error) {
+	record, err := scanRecord(s.db.QueryRowContext(ctx, `
+SELECT id, idempotency_key, request_fingerprint, response_snapshot, created_at_ns, expires_at_ns
+FROM idempotency_records
+WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return record, nil
+}
+
 // ListFilter narrows ListRecords. Zero-valued fields are not applied.
 type ListFilter struct {
 	IdempotencyKey     string

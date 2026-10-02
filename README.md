@@ -67,9 +67,27 @@ go run .
 - 幂等键相同但请求指纹不同：HTTP 409，返回顶层 `error`，其中 `code` 为 `idempotency_fingerprint_conflict`，并带固定顺序的 `record_id` 与 `request_fingerprint`（已有记录的），原记录保持不变。
 - 幂等键为空、请求指纹为空、`expires_at` 缺失或无法解析、或 `expires_at` 不严格晚于当前时刻（相等或更早）：HTTP 400，`code` 为 `invalid_idempotency_record`，不写入记录。`response_snapshot` 省略时按 `null` 存储，但必须是合法 JSON。
 
+成功响应（首次提交与回放）除 JSON 响应体外还带两个响应头：
+
+| 响应头 | 首次提交 | 相同指纹重复提交 |
+|---|---|---|
+| `Idempotency-Outcome` | `created` | `replayed` |
+| `Idempotency-Record-ID` | 新记录的 `id` | 首次记录的同一 `id` |
+
+指纹冲突（409）、校验失败（400）与存储不可用（503）的响应都不带这两个响应头；响应体本身的形态与字节在引入响应头前后保持不变，回放仍逐字节返回首次 `response_snapshot`。
+
 ### `GET /v1/idempotency/records/:idempotency_key`
 
 按键查询，成功返回 `{"record":{...}}`。键不存在或记录已过期时统一返回 HTTP 404，`code` 为 `not_found`，不返回历史响应快照，也不会自动创建占位记录。
+
+### `GET /v1/idempotency/records-by-id/:record_id`
+
+按记录标识只读查询**任意一代**记录（包括已过期的历史行），不插入、不改写，也不改变其他入口的可见结果：
+
+- 存在：HTTP 200，返回 `{"record":{...}}`，字段沿用记录对象的固定顺序，`response_snapshot` 保持首次提交的 JSON 字节；`expires_at` 严格晚于查询时刻时 `status` 为 `active`，否则（相等或更早）为 `expired`。
+- `record_id` 形态不合法（不是 `rec_` 加恰好 32 个小写十六进制字符）：HTTP 400，顶层 `error.code` 为 `invalid_idempotency_record`，请求不访问存储。
+- 形态合法但不存在：HTTP 404，顶层 `error.code` 为 `not_found`。
+- 存储故障：HTTP 503，`code` 为 `storage_unavailable`。
 
 ### `GET /v1/idempotency/records`
 
@@ -111,7 +129,8 @@ go run .
 多个实例共享一个数据库文件并发提交同一 `idempotency_key` 时：
 
 - 请求指纹相同：所有成功请求都返回 HTTP 200、相同的 `record.id`、逐字节一致的首次
-  `response_snapshot` 与相同的时间字段，最终只有一条未过期记录可见。
+  `response_snapshot` 与相同的时间字段，`Idempotency-Record-ID` 头也相同，且只有一个请求的
+  `Idempotency-Outcome` 为 `created`，其余均为 `replayed`，最终只有一条未过期记录可见。
 - 请求指纹不同：只有最先提交成功的请求返回 HTTP 200，其余返回 HTTP 409，顶层
   `error.code` 为 `idempotency_fingerprint_conflict`，并固定回传获胜记录的 `record_id`
   与 `request_fingerprint`；后到请求不会覆盖首次快照。
@@ -120,5 +139,5 @@ go run .
 - 过期审计入口 `GET /v1/idempotency/history` 为只读查询：多实例共享 `DB_PATH` 时各实例都能
   看到同样的历史代际，但它不写入任何行，未过期记录的隔离、首次快照不可变与历史行不物理
   删除的语义都不受影响。
-- 锁等待超过 `busy_timeout`、数据库无法读写或提交结果无法确认时，相关入口返回 HTTP 503，
-  `code` 为 `storage_unavailable`，错误信息不泄露 SQL 细节。
+- 锁等待超过 `busy_timeout`、数据库无法读写或提交结果无法确认时，所有入口（含
+  `records-by-id`）返回 HTTP 503，`code` 为 `storage_unavailable`，错误信息不泄露 SQL 细节。

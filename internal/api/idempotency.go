@@ -23,6 +23,9 @@ const (
 	codeInvalidCursor       = "invalid_cursor"
 	codeStorageUnavailable  = "storage_unavailable"
 
+	headerOutcome  = "Idempotency-Outcome"
+	headerRecordID = "Idempotency-Record-ID"
+
 	defaultPageLimit = 50
 	maxPageLimit     = 100
 )
@@ -147,6 +150,9 @@ func registerIdempotencyRoutes(router *gin.Engine, st *store.Store) {
 	router.GET("/v1/idempotency/records/:key", func(c *gin.Context) {
 		handleGetRecord(c, st)
 	})
+	router.GET("/v1/idempotency/records-by-id/:record_id", func(c *gin.Context) {
+		handleGetRecordByID(c, st)
+	})
 	router.GET("/v1/idempotency/records", func(c *gin.Context) {
 		handleListRecords(c, st)
 	})
@@ -194,8 +200,14 @@ func handleSubmit(c *gin.Context, st *store.Store) {
 			RequestFingerprint: record.RequestFingerprint,
 		}})
 	default:
-		// Both PutCreated and PutReplayed use the exact same success envelope, so a replay is
-		// indistinguishable in shape from the first successful execution.
+		// PutCreated and PutReplayed share the exact same success envelope; only the outcome
+		// header distinguishes the first insert from a byte-for-byte replay.
+		outcomeLabel := "replayed"
+		if outcome == store.PutCreated {
+			outcomeLabel = "created"
+		}
+		c.Header(headerOutcome, outcomeLabel)
+		c.Header(headerRecordID, record.ID)
 		writeRecordEnvelope(c, toRecordResponse(record))
 	}
 }
@@ -216,6 +228,33 @@ func handleGetRecord(c *gin.Context, st *store.Store) {
 		return
 	}
 	writeRecordEnvelope(c, toRecordResponse(record))
+}
+
+// handleGetRecordByID serves the read-only lookup of any record generation, including expired
+// ones. A malformed id is a client error and never reaches storage; a well-formed but unknown id
+// is 404. The endpoint writes nothing and does not change what any other endpoint exposes.
+func handleGetRecordByID(c *gin.Context, st *store.Store) {
+	recordID := c.Param("record_id")
+	if !store.IsRecordID(recordID) {
+		writeInvalidRecord(c, "record_id must be \"rec_\" followed by 32 lowercase hexadecimal characters")
+		return
+	}
+	record, err := st.RecordByID(c.Request.Context(), recordID)
+	if err != nil {
+		writeStorageUnavailable(c)
+		return
+	}
+	if record == nil {
+		writeRecordNotFound(c)
+		return
+	}
+	response := toRecordResponse(record)
+	// Status is derived at query time: only an expiry strictly later than now keeps the record
+	// active; equality already means expired.
+	if !record.ExpiresAt.After(time.Now().UTC()) {
+		response.Status = "expired"
+	}
+	writeRecordEnvelope(c, response)
 }
 
 func handleListRecords(c *gin.Context, st *store.Store) {
@@ -460,6 +499,13 @@ func writeNotFound(c *gin.Context) {
 	c.JSON(http.StatusNotFound, gin.H{"error": errorBody{
 		Code:    codeNotFound,
 		Message: "no active idempotency record exists for this key",
+	}})
+}
+
+func writeRecordNotFound(c *gin.Context) {
+	c.JSON(http.StatusNotFound, gin.H{"error": errorBody{
+		Code:    codeNotFound,
+		Message: "no idempotency record exists for this record id",
 	}})
 }
 
