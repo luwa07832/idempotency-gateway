@@ -112,4 +112,16 @@ CREATE INDEX IF NOT EXISTS idx_idempotency_records_key
 
 CREATE INDEX IF NOT EXISTS idx_idempotency_records_list
 	ON idempotency_records (expires_at_ns, created_at_ns DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS idempotency_reservations (
+	id                  TEXT PRIMARY KEY,
+	idempotency_key     TEXT NOT NULL,
+	request_fingerprint TEXT NOT NULL,
+	record_id           TEXT,
+	created_at_ns       INTEGER NOT NULL,
+	expires_at_ns       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_idempotency_reservations_key
+	ON idempotency_reservations (idempotency_key, created_at_ns DESC, id DESC);
 `

@@ -134,17 +134,5 @@ WHERE id = ? AND idempotency_key = ? AND expires_at_ns <= ?`
 // IsRecordID reports whether id has the fixed shape NewRecordID emits: "rec_" followed by
 // exactly 32 lowercase hexadecimal characters.
 func IsRecordID(id string) bool {
-	const (
-		prefix = "rec_"
-		hexLen = 32
-	)
-	if len(id) != len(prefix)+hexLen || id[:len(prefix)] != prefix {
-		return false
-	}
-	for _, ch := range id[len(prefix):] {
-		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
-			return false
-		}
-	}
-	return true
+	return hasIDShape(id, "rec_")
 }

@@ -36,14 +36,35 @@ const (
 // ErrInvalidID is returned when a pagination cursor references a malformed record id.
 var ErrInvalidID = errors.New("invalid record id")
 
-// NewRecordID generates the public identifier attached to every stored record. The shape is
-// fixed ("rec_" followed by 32 lowercase hex characters) so callers can rely on it.
-func NewRecordID() (string, error) {
+// newPrefixedID generates a public identifier: prefix followed by 32 lowercase hex characters
+// from crypto/rand.
+func newPrefixedID(prefix string) (string, error) {
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}
-	return "rec_" + hex.EncodeToString(raw), nil
+	return prefix + hex.EncodeToString(raw), nil
+}
+
+// hasIDShape reports whether id is prefix followed by exactly 32 lowercase hexadecimal
+// characters, the fixed shape every public identifier this service emits uses.
+func hasIDShape(id, prefix string) bool {
+	const hexLen = 32
+	if len(id) != len(prefix)+hexLen || id[:len(prefix)] != prefix {
+		return false
+	}
+	for _, ch := range id[len(prefix):] {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// NewRecordID generates the public identifier attached to every stored record. The shape is
+// fixed ("rec_" followed by 32 lowercase hex characters) so callers can rely on it.
+func NewRecordID() (string, error) {
+	return newPrefixedID("rec_")
 }
 
 // PutRecord stores the candidate unless an active (non-expired) record already owns the same
@@ -110,7 +131,11 @@ func (s *Store) ActiveRecordByKey(ctx context.Context, key string, now time.Time
 // the record's own expires_at. (nil, nil) means no row carries the id. The method issues no
 // writes and never changes what the active or history endpoints can see.
 func (s *Store) RecordByID(ctx context.Context, id string) (*Record, error) {
-	record, err := scanRecord(s.db.QueryRowContext(ctx, `
+	return queryRecordByID(ctx, s.db, id)
+}
+
+func queryRecordByID(ctx context.Context, querier rowQuerier, id string) (*Record, error) {
+	record, err := scanRecord(querier.QueryRowContext(ctx, `
 SELECT id, idempotency_key, request_fingerprint, response_snapshot, created_at_ns, expires_at_ns
 FROM idempotency_records
 WHERE id = ?`, id))

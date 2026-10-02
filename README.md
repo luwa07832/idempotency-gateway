@@ -120,9 +120,53 @@ go run .
 
 结果按 `created_at` 倒序、同刻按 `id` 倒序，响应信封为 `{"records":[...],"next_cursor":""}`，`next_cursor` 为空表示没有下一页。未知键、无匹配记录或筛选后为空都返回 HTTP 200、空 `records` 与空 `next_cursor`，不创建占位数据。游标无法解码、缺少字段、`id` 形态异常或不指向符合本查询条件的历史记录时，返回 HTTP 400，`code` 为 `invalid_cursor`；其他输入错误使用 `invalid_idempotency_record`。键集游标在翻页期间对新插入、新过期或并发变化保持稳定：已取得的页不会重复或错位。
 
+## 执行占位
+
+执行占位（reservation）在结果尚未产生时先占住幂等键，避免同键同指纹的请求被重复执行；首个结果提交后占位物化为一条既有记录，之后的提交回放该记录。占位对象的字段与顺序固定为：`id`、`idempotency_key`、`request_fingerprint`、`status`、`created_at`、`expires_at`。`status` 按查询时刻推导：已有结果为 `completed`，`expires_at` 到达（相等或更早）仍无结果为 `expired`，否则为 `pending`。
+
+### `POST /v1/idempotency/reservations`
+
+创建执行占位。请求体字段顺序不限：
+
+```json
+{
+  "idempotency_key": "order-123",
+  "request_fingerprint": "sha256:9c28...",
+  "expires_at": "2026-10-01T12:00:00Z"
+}
+```
+
+- 首个请求：HTTP 201，返回 `{"reservation":{...}}`，`status` 为 `pending`，`id` 形如 `res_` 加 32 个小写十六进制字符。
+- 幂等键相同且请求指纹一致（占位未过期）：HTTP 200 复用既有占位，返回同一占位对象，不产生第二条占位。
+- 幂等键相同但请求指纹不同：HTTP 409，返回顶层 `error`，其中 `code` 为 `idempotency_fingerprint_conflict`，并带固定顺序的 `reservation_id` 与 `request_fingerprint`（已有占位的），原占位保持不变。
+- 幂等键为空、请求指纹为空、`expires_at` 缺失或无法解析、或 `expires_at` 不严格晚于创建时刻（相等或更早）：HTTP 400，`code` 为 `invalid_idempotency_record`，不写入占位。
+
+成功响应（201 与 200）都带 `Idempotency-Outcome` 响应头：首次创建为 `created`，其余复用为 `replayed`；冲突（409）、校验失败（400）与存储不可用（503）的响应都不带该响应头。
+
+### `POST /v1/idempotency/reservations/:reservation_id/results`
+
+向占位提交执行结果。请求体字段顺序不限：
+
+```json
+{
+  "request_fingerprint": "sha256:9c28...",
+  "response_snapshot": {"status": "paid"}
+}
+```
+
+- 首次结果：HTTP 200，结果物化为既有记录，返回 `{"record":{...}}`，`id` 形如 `rec_` 加 32 个小写十六进制字符，`created_at` 与 `expires_at` 沿用占位的值，`response_snapshot` 逐字节保存；记录随即对既有记录入口可见。响应头 `Idempotency-Outcome` 为 `created`，`Idempotency-Record-ID` 为新记录的 `id`。
+- 重复结果（指纹一致）：HTTP 200，逐字节回放首次保存的记录，响应头 `Idempotency-Outcome` 为 `replayed`，`Idempotency-Record-ID` 为首次记录的同一 `id`，不产生第二条记录。
+- 请求指纹与占位不一致：HTTP 409，`code` 为 `idempotency_fingerprint_conflict`，并带固定顺序的 `reservation_id` 与 `request_fingerprint`（占位的）。
+- `reservation_id` 形态不合法（不是 `res_` 加恰好 32 个小写十六进制字符）：HTTP 400，`code` 为 `invalid_idempotency_record`，请求不访问存储。
+- 形态合法但不存在：HTTP 404，`code` 为 `not_found`。
+- `expires_at` 到达（相等或更早）仍无结果：占位转为 `expired`，之后提交结果返回 HTTP 409，`code` 为 `idempotency_reservation_expired`；同一幂等键可重新创建新占位。
+- 请求指纹为空或 `response_snapshot` 不是合法 JSON：HTTP 400，`code` 为 `invalid_idempotency_record`。`response_snapshot` 省略时按 `null` 存储。
+
+结果提交把插入记录与更新占位放在同一事务中：存储故障返回 HTTP 503、`code` 为 `storage_unavailable`，不会留下只写了一半的占位或记录。
+
 ## 错误约定
 
-所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。指纹冲突结果同样以顶层 `error` 呈现，并在其后固定附带 `record_id` 与 `request_fingerprint`。存储不可用时所有幂等入口返回 HTTP 503，`code` 为 `storage_unavailable`。
+所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。指纹冲突结果同样以顶层 `error` 呈现，并在其后固定附带 `record_id`（记录入口）或 `reservation_id`（占位入口）与 `request_fingerprint`。存储不可用时所有幂等入口返回 HTTP 503，`code` 为 `storage_unavailable`。
 
 ## 多实例并发语义
 
@@ -141,3 +185,9 @@ go run .
   删除的语义都不受影响。
 - 锁等待超过 `busy_timeout`、数据库无法读写或提交结果无法确认时，所有入口（含
   `records-by-id`）返回 HTTP 503，`code` 为 `storage_unavailable`，错误信息不泄露 SQL 细节。
+
+执行占位遵循同样的选举语义：多个实例并发创建同一幂等键的占位时，只有一个请求返回
+HTTP 201 且 `Idempotency-Outcome` 为 `created`，其余同指纹请求返回 HTTP 200 复用同一占位
+并标 `replayed`，指纹不同的请求返回 HTTP 409；并发向同一占位提交首个结果时，只有一个
+请求物化记录并标 `created`，其余请求逐字节回放获胜记录并标 `replayed`，最终只有一条记录
+可见。既有记录的 active、expired、历史与分页行为不受占位影响。

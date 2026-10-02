@@ -55,22 +55,9 @@ func validateSubmitRequest(rawBody []byte, now time.Time) (validatedSubmitReques
 	if err := json.Unmarshal(rawBody, &request); err != nil {
 		return validatedSubmitRequest{}, "request body must be a single JSON object", false
 	}
-	if strings.TrimSpace(request.IdempotencyKey) == "" {
-		return validatedSubmitRequest{}, "idempotency_key must not be empty", false
-	}
-	if strings.TrimSpace(request.RequestFingerprint) == "" {
-		return validatedSubmitRequest{}, "request_fingerprint must not be empty", false
-	}
-	if request.ExpiresAt == nil || strings.TrimSpace(*request.ExpiresAt) == "" {
-		return validatedSubmitRequest{}, "expires_at must be provided", false
-	}
-	expiresAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*request.ExpiresAt))
-	if err != nil {
-		return validatedSubmitRequest{}, "expires_at must be an RFC 3339 timestamp", false
-	}
-	expiresAt = expiresAt.UTC()
-	if !expiresAt.After(now) {
-		return validatedSubmitRequest{}, "expires_at must be later than the current time", false
+	expiresAt, message, ok := validateKeyFingerprintExpiry(request.IdempotencyKey, request.RequestFingerprint, request.ExpiresAt, now)
+	if !ok {
+		return validatedSubmitRequest{}, message, false
 	}
 	snapshot := request.ResponseSnapshot
 	if len(snapshot) == 0 {
@@ -88,6 +75,30 @@ func validateSubmitRequest(rawBody []byte, now time.Time) (validatedSubmitReques
 		responseSnapshot:   snapshot,
 		expiresAt:          expiresAt,
 	}, "", true
+}
+
+// validateKeyFingerprintExpiry enforces the identity and expiry rules shared by record
+// submission and reservation creation. The returned time is normalized to UTC; the message is
+// the fixed InvalidIdempotencyRequest message for the violated rule.
+func validateKeyFingerprintExpiry(idempotencyKey, requestFingerprint string, expiresAt *string, now time.Time) (time.Time, string, bool) {
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return time.Time{}, "idempotency_key must not be empty", false
+	}
+	if strings.TrimSpace(requestFingerprint) == "" {
+		return time.Time{}, "request_fingerprint must not be empty", false
+	}
+	if expiresAt == nil || strings.TrimSpace(*expiresAt) == "" {
+		return time.Time{}, "expires_at must be provided", false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*expiresAt))
+	if err != nil {
+		return time.Time{}, "expires_at must be an RFC 3339 timestamp", false
+	}
+	parsed = parsed.UTC()
+	if !parsed.After(now) {
+		return time.Time{}, "expires_at must be later than the current time", false
+	}
+	return parsed, "", true
 }
 
 // recordResponse lists its fields in the fixed order every record-shaped result uses.
@@ -155,6 +166,12 @@ func registerIdempotencyRoutes(router *gin.Engine, st *store.Store) {
 	})
 	router.GET("/v1/idempotency/records", func(c *gin.Context) {
 		handleListRecords(c, st)
+	})
+	router.POST("/v1/idempotency/reservations", func(c *gin.Context) {
+		handleCreateReservation(c, st)
+	})
+	router.POST("/v1/idempotency/reservations/:reservation_id/results", func(c *gin.Context) {
+		handleSubmitResult(c, st)
 	})
 }
 
