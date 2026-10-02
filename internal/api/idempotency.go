@@ -73,7 +73,10 @@ func validateSubmitRequest(rawBody []byte, now time.Time) (validatedSubmitReques
 	if len(snapshot) == 0 {
 		snapshot = json.RawMessage("null")
 	}
-	if !isValidJSON(snapshot) {
+	// Validate without a re-encoding round trip: both Unmarshal/Marshal and json.Compact drop
+	// insignificant whitespace, but the first submission's exact JSON bytes must be stored and
+	// replayed byte-for-byte.
+	if !isValidJSONBytes(snapshot) {
 		return validatedSubmitRequest{}, "response_snapshot must be valid JSON", false
 	}
 	return validatedSubmitRequest{
@@ -93,15 +96,6 @@ type recordResponse struct {
 	ResponseSnapshot   json.RawMessage `json:"response_snapshot"`
 	CreatedAt          string          `json:"created_at"`
 	ExpiresAt          string          `json:"expires_at"`
-}
-
-type recordEnvelope struct {
-	Record recordResponse `json:"record"`
-}
-
-type listResponse struct {
-	Records    []recordResponse `json:"records"`
-	NextCursor string           `json:"next_cursor"`
 }
 
 type conflictBody struct {
@@ -146,6 +140,9 @@ func parsePageCursor(token string) (pageCursor, error) {
 func registerIdempotencyRoutes(router *gin.Engine, st *store.Store) {
 	router.POST("/v1/idempotency/records", func(c *gin.Context) {
 		handleSubmit(c, st)
+	})
+	router.GET("/v1/idempotency/history", func(c *gin.Context) {
+		handleListHistory(c, st)
 	})
 	router.GET("/v1/idempotency/records/:key", func(c *gin.Context) {
 		handleGetRecord(c, st)
@@ -199,7 +196,7 @@ func handleSubmit(c *gin.Context, st *store.Store) {
 	default:
 		// Both PutCreated and PutReplayed use the exact same success envelope, so a replay is
 		// indistinguishable in shape from the first successful execution.
-		c.JSON(http.StatusOK, recordEnvelope{Record: toRecordResponse(record)})
+		writeRecordEnvelope(c, toRecordResponse(record))
 	}
 }
 
@@ -218,7 +215,7 @@ func handleGetRecord(c *gin.Context, st *store.Store) {
 		writeNotFound(c)
 		return
 	}
-	c.JSON(http.StatusOK, recordEnvelope{Record: toRecordResponse(record)})
+	writeRecordEnvelope(c, toRecordResponse(record))
 }
 
 func handleListRecords(c *gin.Context, st *store.Store) {
@@ -281,7 +278,7 @@ func handleListRecords(c *gin.Context, st *store.Store) {
 	// Expired records never participate in normal results; the page is deterministically empty
 	// rather than surfacing historical snapshots. Parameters above are still validated first.
 	if strings.TrimSpace(c.Query("status")) == "expired" {
-		c.JSON(http.StatusOK, listResponse{Records: []recordResponse{}, NextCursor: ""})
+		writeListResponse(c, nil, "")
 		return
 	}
 
@@ -300,12 +297,11 @@ func handleListRecords(c *gin.Context, st *store.Store) {
 		records = records[:len(records)-1]
 	}
 
-	response := listResponse{Records: make([]recordResponse, 0, len(records))}
+	page := make([]recordResponse, 0, len(records))
 	for i := range records {
-		response.Records = append(response.Records, toRecordResponse(&records[i]))
+		page = append(page, toRecordResponse(&records[i]))
 	}
-	response.NextCursor = nextCursor
-	c.JSON(http.StatusOK, response)
+	writeListResponse(c, page, nextCursor)
 }
 
 func parseQueryTime(c *gin.Context, raw string) (time.Time, bool) {
@@ -315,6 +311,99 @@ func parseQueryTime(c *gin.Context, raw string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return parsed.UTC(), true
+}
+
+// handleListHistory serves the read-only expired-record audit. It only ever returns rows that
+// were already expired when the query ran; the active endpoints keep their own response and error
+// semantics and never surface these snapshots. The query is read-only: no row is inserted,
+// rewritten, merged or deleted, and an unknown key is an empty page rather than a placeholder.
+func handleListHistory(c *gin.Context, st *store.Store) {
+	now := time.Now().UTC()
+
+	key := strings.TrimSpace(c.Query("key"))
+	if key == "" {
+		writeInvalidRecord(c, "key must identify an idempotency key")
+		return
+	}
+	filter := store.HistoryFilter{
+		IdempotencyKey:     key,
+		RequestFingerprint: c.Query("request_fingerprint"),
+		Limit:              defaultPageLimit,
+	}
+
+	if raw := strings.TrimSpace(c.Query("expires_before")); raw != "" {
+		parsed, ok := parseQueryTime(c, raw)
+		if !ok {
+			return
+		}
+		filter.ExpiresBefore = &parsed
+	}
+	if raw := strings.TrimSpace(c.Query("expires_after")); raw != "" {
+		parsed, ok := parseQueryTime(c, raw)
+		if !ok {
+			return
+		}
+		filter.ExpiresAfter = &parsed
+	}
+
+	if rawLimit := strings.TrimSpace(c.Query("limit")); rawLimit != "" {
+		limit, ok := parseQueryLimit(c, rawLimit)
+		if !ok {
+			return
+		}
+		filter.Limit = limit
+	}
+
+	if rawCursor := strings.TrimSpace(c.Query("cursor")); rawCursor != "" {
+		cursor, err := parsePageCursor(rawCursor)
+		if err != nil {
+			writeInvalidCursor(c)
+			return
+		}
+		filter.CursorCreatedAt = cursor.CreatedAt
+		filter.CursorID = cursor.ID
+	}
+
+	// Fetch one extra row to decide whether another page exists without an unstable total count.
+	filter.Limit++
+	records, err := st.ListHistoryRecords(c.Request.Context(), filter, now)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrInvalidID), errors.Is(err, store.ErrCursorTarget):
+			writeInvalidCursor(c)
+		default:
+			writeStorageUnavailable(c)
+		}
+		return
+	}
+
+	nextCursor := ""
+	if len(records) == filter.Limit {
+		last := records[len(records)-2]
+		nextCursor = pageCursor{CreatedAt: last.CreatedAt, ID: last.ID}.encode()
+		records = records[:len(records)-1]
+	}
+
+	page := make([]recordResponse, 0, len(records))
+	for i := range records {
+		page = append(page, toHistoryRecordResponse(&records[i]))
+	}
+	writeListResponse(c, page, nextCursor)
+}
+
+// toHistoryRecordResponse renders one expired generation with the same fixed field order as
+// active records; only status differs ("expired") and the snapshot is replayed byte-for-byte.
+func toHistoryRecordResponse(record *store.Record) recordResponse {
+	response := toRecordResponse(record)
+	response.Status = "expired"
+	return response
+}
+
+func writeInvalidCursor(c *gin.Context) {
+	c.JSON(http.StatusBadRequest, gin.H{"error": errorBody{
+		Code:    codeInvalidCursor,
+		Message: "pagination cursor is invalid",
+	}})
 }
 
 func parseQueryLimit(c *gin.Context, raw string) (int, bool) {
@@ -348,9 +437,19 @@ func toRecordResponse(record *store.Record) recordResponse {
 	}
 }
 
-func isValidJSON(raw json.RawMessage) bool {
+// isValidJSONBytes reports whether raw is exactly one complete JSON value, without re-encoding
+// (and therefore without normalizing) its bytes.
+func isValidJSONBytes(raw []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
 	var value any
-	return json.Unmarshal(raw, &value) == nil
+	if err := decoder.Decode(&value); err != nil {
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return false
+	}
+	return true
 }
 
 func writeInvalidRecord(c *gin.Context, message string) {

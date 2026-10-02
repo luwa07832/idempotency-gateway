@@ -2,10 +2,12 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -284,4 +286,63 @@ func firstOKIndex(statuses []int) int {
 		}
 	}
 	return 0
+}
+
+// TestCrossInstancesHistoryAuditIsReadOnlyAcrossInstances writes one expired generation through a
+// direct store open on the shared DB_PATH (submission cannot create an already-expired row) and
+// then asserts every instance can audit it read-only while the active endpoints keep hiding it.
+func TestCrossInstancesHistoryAuditIsReadOnlyAcrossInstances(t *testing.T) {
+	const instances = 4
+	routers, path := newSharedRouters(t, instances)
+
+	writer, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	t.Cleanup(func() { writer.Close() })
+
+	now := time.Now().UTC()
+	old := store.Record{
+		ID:                 "rec_" + strings.Repeat("a", 32),
+		IdempotencyKey:     "audit-key",
+		RequestFingerprint: "fp-old",
+		ResponseSnapshot:   []byte(`{"v":"old"}`),
+		CreatedAt:          now.Add(-2 * time.Hour),
+		ExpiresAt:          now.Add(-time.Hour),
+	}
+	if _, _, err := writer.PutRecord(context.Background(), old, now.Add(-2*time.Hour)); err != nil {
+		t.Fatalf("seed expired row: %v", err)
+	}
+
+	for i, router := range routers {
+		history := doJSON(t, router, http.MethodGet, "/v1/idempotency/history?key=audit-key", "")
+		if history.Code != http.StatusOK {
+			t.Fatalf("instance %d history status = %d %s", i, history.Code, history.Body.String())
+		}
+		if !bytes.Contains(history.Body.Bytes(), []byte(`"v":"old"`)) ||
+			!bytes.Contains(history.Body.Bytes(), []byte(`"status":"expired"`)) {
+			t.Fatalf("instance %d did not audit the shared history: %s", i, history.Body.String())
+		}
+		if bytes.Count(history.Body.Bytes(), []byte(`"id":"rec_`)) != 1 {
+			t.Fatalf("instance %d history row count wrong: %s", i, history.Body.String())
+		}
+
+		active := doJSON(t, router, http.MethodGet, "/v1/idempotency/records/audit-key", "")
+		if active.Code != http.StatusNotFound {
+			t.Fatalf("instance %d leaked expired snapshot via active lookup: %d %s", i, active.Code, active.Body.String())
+		}
+	}
+
+	// Querying history must not create placeholder rows: the key still 404s on the active path and
+	// the history stays one row.
+	for _, router := range routers {
+		_ = doJSON(t, router, http.MethodGet, "/v1/idempotency/history?key=never-seen", "")
+	}
+	again := doJSON(t, routers[0], http.MethodGet, "/v1/idempotency/history?key=audit-key", "")
+	if bytes.Count(again.Body.Bytes(), []byte(`"id":"rec_`)) != 1 {
+		t.Fatalf("read-only audit changed row count: %s", again.Body.String())
+	}
+	if missing := doJSON(t, routers[0], http.MethodGet, "/v1/idempotency/history?key=never-seen", ""); missing.Body.String() != `{"records":[],"next_cursor":""}` {
+		t.Fatalf("unknown key created placeholder data: %s", missing.Body.String())
+	}
 }

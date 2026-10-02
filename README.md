@@ -87,6 +87,21 @@ go run .
 
 游标为键集分页（编码了上一页末尾记录的创建时间与 `id`），翻页期间新插入的记录不会让更早的页重复或错位。
 
+### `GET /v1/idempotency/history`
+
+过期记录审计查询，只读返回同一幂等键各代历史记录；不插入、不改写、不合并、不物理删除任何行，正常入口（提交、按键读取、列表）的响应与错误语义保持不变，也不会经它们泄露过期快照。只返回查询时刻已经过期（`expires_at` 早于或等于当前时刻）的行，记录字段与正常记录相同且顺序固定为 `id`、`idempotency_key`、`status`、`request_fingerprint`、`response_snapshot`、`created_at`、`expires_at`，其中 `status` 恒为 `expired`，`response_snapshot` 逐字节保留首次提交的 JSON。
+
+| 查询参数 | 说明 |
+|---|---|
+| `key` | 必填，指定要审计的幂等键；为空或缺失返回 HTTP 400，`code` 为 `invalid_idempotency_record`。结果只含该键的各代记录 |
+| `request_fingerprint` | 按原值逐字符精确匹配（不做大小写折叠、修剪或前缀匹配），空值不筛选；空白是真实筛选值 |
+| `expires_before` | RFC 3339 时间，仅匹配 `expires_at` 严格早于该时间的行 |
+| `expires_after` | RFC 3339 时间，仅匹配 `expires_at` 严格晚于该时间的行 |
+| `limit` | 每页条数，只接受 1–100 的十进制整数，默认 50；其他取值返回 `invalid_idempotency_record` |
+| `cursor` | 沿用与列表相同的不透明键集游标（上一页末条记录的 `created_at` 与 `id`） |
+
+结果按 `created_at` 倒序、同刻按 `id` 倒序，响应信封为 `{"records":[...],"next_cursor":""}`，`next_cursor` 为空表示没有下一页。未知键、无匹配记录或筛选后为空都返回 HTTP 200、空 `records` 与空 `next_cursor`，不创建占位数据。游标无法解码、缺少字段、`id` 形态异常或不指向符合本查询条件的历史记录时，返回 HTTP 400，`code` 为 `invalid_cursor`；其他输入错误使用 `invalid_idempotency_record`。键集游标在翻页期间对新插入、新过期或并发变化保持稳定：已取得的页不会重复或错位。
+
 ## 错误约定
 
 所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。指纹冲突结果同样以顶层 `error` 呈现，并在其后固定附带 `record_id` 与 `request_fingerprint`。存储不可用时所有幂等入口返回 HTTP 503，`code` 为 `storage_unavailable`。
@@ -102,5 +117,8 @@ go run .
   与 `request_fingerprint`；后到请求不会覆盖首次快照。
 - 记录过期后并发重提：只新增一条记录，获胜记录之后的请求回放它；新旧行都保留在底层历史
   表中，不删除、不改写、不合并，查询与列表始终只暴露未过期记录。
+- 过期审计入口 `GET /v1/idempotency/history` 为只读查询：多实例共享 `DB_PATH` 时各实例都能
+  看到同样的历史代际，但它不写入任何行，未过期记录的隔离、首次快照不可变与历史行不物理
+  删除的语义都不受影响。
 - 锁等待超过 `busy_timeout`、数据库无法读写或提交结果无法确认时，相关入口返回 HTTP 503，
   `code` 为 `storage_unavailable`，错误信息不泄露 SQL 细节。
