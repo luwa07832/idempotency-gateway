@@ -102,3 +102,47 @@ func writeListResponse(c *gin.Context, records []recordResponse, nextCursor stri
 	body.WriteByte('}')
 	c.Data(http.StatusOK, "application/json; charset=utf-8", body.Bytes())
 }
+
+// writePreviewCreated answers the pre-commit check when no active record owns the key. Unknown
+// keys and fully expired keys share this outcome; the check creates nothing.
+func writePreviewCreated(c *gin.Context) {
+	c.Data(http.StatusOK, "application/json; charset=utf-8", []byte(`{"outcome":"created"}`))
+}
+
+// writePreviewReplayed embeds the existing active record, field order and snapshot bytes
+// unchanged, in {"outcome":"replayed","record":{...}}.
+func writePreviewReplayed(c *gin.Context, record recordResponse) {
+	object, err := marshalRecordObject(record)
+	if err != nil {
+		writeStorageUnavailable(c)
+		return
+	}
+	body := make([]byte, 0, len(object)+28)
+	body = append(body, `{"outcome":"replayed","record":`...)
+	body = append(body, object...)
+	body = append(body, '}')
+	c.Data(http.StatusOK, "application/json; charset=utf-8", body)
+}
+
+// writePreviewConflict identifies the active record with a differing fingerprint but never
+// surfaces its snapshot.
+func writePreviewConflict(c *gin.Context, recordID, requestFingerprint string) {
+	id, err := json.Marshal(recordID)
+	if err != nil {
+		writeStorageUnavailable(c)
+		return
+	}
+	fingerprint, err := json.Marshal(requestFingerprint)
+	if err != nil {
+		writeStorageUnavailable(c)
+		return
+	}
+	var body bytes.Buffer
+	body.Grow(len(id) + len(fingerprint) + 64)
+	body.WriteString(`{"outcome":"conflict","record_id":`)
+	body.Write(id)
+	body.WriteString(`,"request_fingerprint":`)
+	body.Write(fingerprint)
+	body.WriteByte('}')
+	c.Data(http.StatusOK, "application/json; charset=utf-8", body.Bytes())
+}

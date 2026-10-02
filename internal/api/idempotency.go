@@ -145,6 +145,9 @@ func registerIdempotencyRoutes(router *gin.Engine, st *store.Store) {
 	router.POST("/v1/idempotency/records", func(c *gin.Context) {
 		handleSubmit(c, st)
 	})
+	router.POST("/v1/idempotency/records/preview", func(c *gin.Context) {
+		handlePreviewSubmit(c, st)
+	})
 	router.GET("/v1/idempotency/conflicts", func(c *gin.Context) {
 		handleListConflicts(c, st)
 	})
@@ -213,6 +216,41 @@ func handleSubmit(c *gin.Context, st *store.Store) {
 		c.Header(headerOutcome, outcomeLabel)
 		c.Header(headerRecordID, record.ID)
 		writeRecordEnvelope(c, toRecordResponse(record))
+	}
+}
+
+// handlePreviewSubmit is the read-only pre-commit check. It runs the same validation as
+// handleSubmit but never creates a record, never rewrites a snapshot and never writes a conflict
+// event. Expired rows are treated as absent: ActiveRecordByKey filters them out, so neither the
+// replayed nor the conflict outcome can replay history. The result only describes the
+// observation at handling time; a later submit, expiry or concurrent write is not promised to
+// match it, so the outcome headers are intentionally never set.
+func handlePreviewSubmit(c *gin.Context, st *store.Store) {
+	now := time.Now().UTC()
+
+	rawBody, err := io.ReadAll(c.Request.Body)
+	if err != nil || len(bytes.TrimSpace(rawBody)) == 0 {
+		writeInvalidRecord(c, "request body must be a single JSON object")
+		return
+	}
+	validated, message, ok := validateSubmitRequest(rawBody, now)
+	if !ok {
+		writeInvalidRecord(c, message)
+		return
+	}
+
+	record, err := st.ActiveRecordByKey(c.Request.Context(), validated.idempotencyKey, now)
+	if err != nil {
+		writeStorageUnavailable(c)
+		return
+	}
+	switch {
+	case record == nil:
+		writePreviewCreated(c)
+	case record.RequestFingerprint == validated.requestFingerprint:
+		writePreviewReplayed(c, toRecordResponse(record))
+	default:
+		writePreviewConflict(c, record.ID, record.RequestFingerprint)
 	}
 }
 

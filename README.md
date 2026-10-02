@@ -76,6 +76,16 @@ go run .
 
 指纹冲突（409）、校验失败（400）与存储不可用（503）的响应都不带这两个响应头；响应体本身的形态与字节在引入响应头前后保持不变，回放仍逐字节返回首次 `response_snapshot`。
 
+### `POST /v1/idempotency/records/preview`
+
+只读的提交预检。请求体沿用提交入口的 `idempotency_key`、`request_fingerprint`、`response_snapshot`、`expires_at` 语义与全部输入校验（`response_snapshot` 省略时按 `null`，但必须是合法 JSON）。预检不创建记录、不改写任何快照、不写冲突事件，三种结果都不带 `Idempotency-Outcome` 与 `Idempotency-Record-ID` 响应头，HTTP 状态均为 200：
+
+- 没有未过期记录（键不存在或该键的记录都已过期）：`{"outcome":"created"}`。过期记录不从历史行回放。
+- 已有未过期记录且请求指纹完全相同：`{"outcome":"replayed","record":{...}}`，`record` 保持记录对象的固定字段顺序并逐字节保留首次 `response_snapshot`。
+- 已有未过期记录但请求指纹不同：`{"outcome":"conflict","record_id":"...","request_fingerprint":"..."}`，后两项取自既有有效记录，且不返回快照。
+
+校验失败返回 HTTP 400，顶层 `error` 只有 `code`（固定为 `invalid_idempotency_record`）与 `message`，且不写入；存储读取失败返回 HTTP 503，`code` 为 `storage_unavailable`。预检只保证处理时刻的观察结果：之后的提交、过期或并发写入都可能改变结论，预检不作任何承诺。提交入口的创建、回放、409 冲突与原子冲突事件保存语义不受预检影响。
+
 ### `GET /v1/idempotency/records/:idempotency_key`
 
 按键查询，成功返回 `{"record":{...}}`。键不存在或记录已过期时统一返回 HTTP 404，`code` 为 `not_found`，不返回历史响应快照，也不会自动创建占位记录。
