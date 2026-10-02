@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -44,6 +45,24 @@ func NewRecordID() (string, error) {
 		return "", err
 	}
 	return "rec_" + hex.EncodeToString(raw), nil
+}
+
+// ValidRecordID reports whether id has the fixed record identifier shape ("rec_" followed by
+// exactly 32 lowercase hexadecimal characters). Cursors referencing any other shape point at an
+// abnormal record and must be rejected.
+func ValidRecordID(id string) bool {
+	const prefix = "rec_"
+	if !strings.HasPrefix(id, prefix) || len(id) != len(prefix)+32 {
+		return false
+	}
+	for i := len(prefix); i < len(id); i++ {
+		switch digit := id[i]; {
+		case digit >= '0' && digit <= '9', digit >= 'a' && digit <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // PutRecord stores the candidate unless an active (non-expired) record already owns the same
@@ -131,6 +150,78 @@ WHERE expires_at_ns > ?`
 		query += ` AND idempotency_key = ?`
 		args = append(args, filter.IdempotencyKey)
 	}
+	if filter.RequestFingerprint != "" {
+		query += ` AND request_fingerprint = ?`
+		args = append(args, filter.RequestFingerprint)
+	}
+	if filter.ExpiresBefore != nil {
+		query += ` AND expires_at_ns < ?`
+		args = append(args, filter.ExpiresBefore.UnixNano())
+	}
+	if filter.ExpiresAfter != nil {
+		query += ` AND expires_at_ns > ?`
+		args = append(args, filter.ExpiresAfter.UnixNano())
+	}
+	if !filter.CursorCreatedAt.IsZero() && filter.CursorID != "" {
+		query += ` AND (created_at_ns < ? OR (created_at_ns = ? AND id < ?))`
+		args = append(args, filter.CursorCreatedAt.UnixNano(), filter.CursorCreatedAt.UnixNano(), filter.CursorID)
+	}
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = defaultListLimit
+	}
+	query += ` ORDER BY created_at_ns DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	records := make([]Record, 0)
+	for rows.Next() {
+		record, err := scanRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, *record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+// HistoryFilter narrows ListHistoryRecords. The remaining fields are optional and zero-valued
+// fields are not applied.
+type HistoryFilter struct {
+	IdempotencyKey     string
+	RequestFingerprint string
+	ExpiresBefore      *time.Time
+	ExpiresAfter       *time.Time
+	CursorCreatedAt    time.Time
+	CursorID           string
+	Limit              int
+}
+
+// ListHistoryRecords returns only the rows for filter.IdempotencyKey that have already expired at
+// now. Rows are ordered newest first by created_at with id as the deterministic tie-breaker; the
+// cursor encodes the last row of the previous page and only strictly earlier rows are returned, so
+// inserts or rows expiring while a client pages never duplicate or shift earlier pages. No row is
+// ever inserted, updated or deleted, and active rows never appear here.
+func (s *Store) ListHistoryRecords(ctx context.Context, filter HistoryFilter, now time.Time) ([]Record, error) {
+	if filter.CursorID != "" && (filter.CursorCreatedAt.IsZero() || !ValidRecordID(filter.CursorID)) {
+		return nil, ErrInvalidID
+	}
+
+	query := `
+SELECT id, idempotency_key, request_fingerprint, response_snapshot, created_at_ns, expires_at_ns
+FROM idempotency_records
+WHERE expires_at_ns <= ? AND idempotency_key = ?`
+	args := []any{now.UnixNano(), filter.IdempotencyKey}
+
 	if filter.RequestFingerprint != "" {
 		query += ` AND request_fingerprint = ?`
 		args = append(args, filter.RequestFingerprint)

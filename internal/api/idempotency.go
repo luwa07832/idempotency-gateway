@@ -143,6 +143,64 @@ func parsePageCursor(token string) (pageCursor, error) {
 	return cursor, nil
 }
 
+// writeHistoryResponse serializes the audit page directly instead of going through c.JSON: the
+// standard encoding/json Marshaler path compacts Marshaler output, which would normalize the
+// stored response_snapshot bytes. Building the document from encoded strings and raw snapshot
+// bytes preserves the first committed JSON verbatim while keeping the fixed field order.
+func writeHistoryResponse(c *gin.Context, records []store.Record, nextCursor string) {
+	var b bytes.Buffer
+	b.Grow(512)
+	b.WriteString(`{"records":[`)
+	for i := range records {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		writeHistoryRecord(&b, &records[i])
+	}
+	b.WriteString(`],"next_cursor":`)
+	encodedCursor, err := json.Marshal(nextCursor)
+	if err != nil {
+		writeStorageUnavailable(c)
+		return
+	}
+	b.Write(encodedCursor)
+	b.WriteByte('}')
+	c.Data(http.StatusOK, "application/json; charset=utf-8", b.Bytes())
+}
+
+func writeHistoryRecord(b *bytes.Buffer, record *store.Record) {
+	b.WriteString(`{"id":`)
+	writeJSONString(b, record.ID)
+	writeJSONField(b, "idempotency_key", record.IdempotencyKey)
+	writeJSONField(b, "status", "expired")
+	writeJSONField(b, "request_fingerprint", record.RequestFingerprint)
+	b.WriteString(`,"response_snapshot":`)
+	snapshot := record.ResponseSnapshot
+	if len(snapshot) == 0 {
+		snapshot = []byte("null")
+	}
+	b.Write(snapshot)
+	writeJSONField(b, "created_at", record.CreatedAt.Format(time.RFC3339Nano))
+	writeJSONField(b, "expires_at", record.ExpiresAt.Format(time.RFC3339Nano))
+	b.WriteByte('}')
+}
+
+func writeJSONField(b *bytes.Buffer, name, value string) {
+	b.WriteString(`,"`)
+	b.WriteString(name)
+	b.WriteString(`":`)
+	writeJSONString(b, value)
+}
+
+func writeJSONString(b *bytes.Buffer, value string) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		b.WriteString("null")
+		return
+	}
+	b.Write(encoded)
+}
+
 func registerIdempotencyRoutes(router *gin.Engine, st *store.Store) {
 	router.POST("/v1/idempotency/records", func(c *gin.Context) {
 		handleSubmit(c, st)
@@ -152,6 +210,9 @@ func registerIdempotencyRoutes(router *gin.Engine, st *store.Store) {
 	})
 	router.GET("/v1/idempotency/records", func(c *gin.Context) {
 		handleListRecords(c, st)
+	})
+	router.GET("/v1/idempotency/history", func(c *gin.Context) {
+		handleListHistory(c, st)
 	})
 }
 
@@ -306,6 +367,81 @@ func handleListRecords(c *gin.Context, st *store.Store) {
 	}
 	response.NextCursor = nextCursor
 	c.JSON(http.StatusOK, response)
+}
+
+func handleListHistory(c *gin.Context, st *store.Store) {
+	now := time.Now().UTC()
+
+	key := strings.TrimSpace(c.Query("key"))
+	if key == "" {
+		writeInvalidRecord(c, "key must identify an idempotency record")
+		return
+	}
+
+	filter := store.HistoryFilter{IdempotencyKey: key, Limit: defaultPageLimit}
+	// The fingerprint is matched character-for-character against the raw query value: no trimming,
+	// case folding or other normalization. An empty value simply does not filter.
+	filter.RequestFingerprint = c.Query("request_fingerprint")
+
+	if raw := strings.TrimSpace(c.Query("expires_before")); raw != "" {
+		parsed, ok := parseQueryTime(c, raw)
+		if !ok {
+			return
+		}
+		filter.ExpiresBefore = &parsed
+	}
+	if raw := strings.TrimSpace(c.Query("expires_after")); raw != "" {
+		parsed, ok := parseQueryTime(c, raw)
+		if !ok {
+			return
+		}
+		filter.ExpiresAfter = &parsed
+	}
+
+	if rawLimit := strings.TrimSpace(c.Query("limit")); rawLimit != "" {
+		limit, ok := parseQueryLimit(c, rawLimit)
+		if !ok {
+			return
+		}
+		filter.Limit = limit
+	}
+
+	if rawCursor := strings.TrimSpace(c.Query("cursor")); rawCursor != "" {
+		cursor, err := parsePageCursor(rawCursor)
+		if err != nil || !store.ValidRecordID(cursor.ID) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errorBody{
+				Code:    codeInvalidCursor,
+				Message: "pagination cursor is invalid",
+			}})
+			return
+		}
+		filter.CursorCreatedAt = cursor.CreatedAt
+		filter.CursorID = cursor.ID
+	}
+
+	// Fetch one extra row to decide whether another page exists without an unstable total count.
+	filter.Limit++
+	records, err := st.ListHistoryRecords(c.Request.Context(), filter, now)
+	if err != nil {
+		if errors.Is(err, store.ErrInvalidID) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errorBody{
+				Code:    codeInvalidCursor,
+				Message: "pagination cursor is invalid",
+			}})
+			return
+		}
+		writeStorageUnavailable(c)
+		return
+	}
+
+	nextCursor := ""
+	if len(records) == filter.Limit {
+		last := records[len(records)-2]
+		nextCursor = pageCursor{CreatedAt: last.CreatedAt, ID: last.ID}.encode()
+		records = records[:len(records)-1]
+	}
+
+	writeHistoryResponse(c, records, nextCursor)
 }
 
 func parseQueryTime(c *gin.Context, raw string) (time.Time, bool) {

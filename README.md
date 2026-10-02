@@ -87,6 +87,31 @@ go run .
 
 游标为键集分页（编码了上一页末尾记录的创建时间与 `id`），翻页期间新插入的记录不会让更早的页重复或错位。
 
+### `GET /v1/idempotency/history`
+
+过期记录审计查询，只读返回同一幂等键各代已过期记录。只返回查询时刻已经过期的行
+（`expires_at` 早于或等于当前时刻），未过期记录不会出现；该入口不写入、不改写、不合并也不
+物理删除任何历史行。记录字段顺序固定为 `id`、`idempotency_key`、`status`（此入口恒为
+`expired`）、`request_fingerprint`、`response_snapshot`、`created_at`、`expires_at`，
+`response_snapshot` 按首次提交保存的 JSON 字节原样输出，时间均为 RFC 3339 UTC 字符串。结果按
+`created_at` 倒序、同刻按 `id` 倒序返回 `{"records":[...],"next_cursor":""}`。未知键或无匹配
+记录时返回 HTTP 200、空 `records` 与空 `next_cursor`，不创建占位数据。
+
+| 查询参数 | 说明 |
+|---|---|
+| `key` | 必填，指定幂等键；为空或只含空白时返回 HTTP 400，`code` 为 `invalid_idempotency_record` |
+| `request_fingerprint` | 与原值逐字符精确匹配：不做大小写折叠、前缀匹配或空白裁剪；省略或传空字符串等价于不过滤 |
+| `expires_before` | RFC 3339 时间，仅匹配 `expires_at` 严格早于该时间的行（相等不匹配） |
+| `expires_after` | RFC 3339 时间，仅匹配 `expires_at` 严格晚于该时间的行（相等不匹配） |
+| `limit` | 每页条数，只接受 1–100 的十进制整数，默认 50；非法值返回 `invalid_idempotency_record` |
+| `cursor` | 沿用列表入口的不透明键集分页游标，编码上一页末条记录的 `created_at` 与 `id` |
+
+游标为键集分页：翻页期间的新插入、新过期或并发变化不会让已经取得的页重复或错位。游标无法
+解码、缺少字段或其中的记录标识不符合 `rec_` 加 32 个小写十六进制字符的固定形态时，返回
+HTTP 400，`code` 为 `invalid_cursor`；其他输入错误仍使用 `invalid_idempotency_record`。数据
+库不可读写时返回 HTTP 503，`code` 为 `storage_unavailable`，`message` 不包含 SQL、堆栈或文件
+路径。正常的按键读取与列表入口继续只暴露未过期记录，审计入口不会改变它们的响应或错误语义。
+
 ## 错误约定
 
 所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。指纹冲突结果同样以顶层 `error` 呈现，并在其后固定附带 `record_id` 与 `request_fingerprint`。存储不可用时所有幂等入口返回 HTTP 503，`code` 为 `storage_unavailable`。
