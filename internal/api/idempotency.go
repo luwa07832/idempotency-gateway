@@ -145,6 +145,9 @@ func registerIdempotencyRoutes(router *gin.Engine, st *store.Store) {
 	router.POST("/v1/idempotency/records", func(c *gin.Context) {
 		handleSubmit(c, st)
 	})
+	router.POST("/v1/idempotency/records/preview", func(c *gin.Context) {
+		handlePreviewSubmit(c, st)
+	})
 	router.GET("/v1/idempotency/conflicts", func(c *gin.Context) {
 		handleListConflicts(c, st)
 	})
@@ -232,6 +235,43 @@ func handleGetRecord(c *gin.Context, st *store.Store) {
 		return
 	}
 	writeRecordEnvelope(c, toRecordResponse(record))
+}
+
+// handlePreviewSubmit is the strictly read-only counterpart of handleSubmit. It validates the
+// exact same submission contract and observes the active record for the key at the handling
+// moment, but never inserts a row, never rewrites a snapshot and never persists a conflict event.
+// The result is an observation only: a later submit, expiry or concurrent write is not promised
+// to agree with it, and no Idempotency-* headers are emitted on any of the three outcomes.
+func handlePreviewSubmit(c *gin.Context, st *store.Store) {
+	now := time.Now().UTC()
+
+	rawBody, err := io.ReadAll(c.Request.Body)
+	if err != nil || len(bytes.TrimSpace(rawBody)) == 0 {
+		writeInvalidRecord(c, "request body must be a single JSON object")
+		return
+	}
+	validated, message, ok := validateSubmitRequest(rawBody, now)
+	if !ok {
+		writeInvalidRecord(c, message)
+		return
+	}
+
+	record, err := st.ActiveRecordByKey(c.Request.Context(), validated.idempotencyKey, now)
+	if err != nil {
+		writeStorageUnavailable(c)
+		return
+	}
+	// A missing key and an all-expired key are indistinguishable here: an expired historical row
+	// is never replayed by a preview, so both observations are "created".
+	if record == nil {
+		writePreviewCreated(c)
+		return
+	}
+	if record.RequestFingerprint != validated.requestFingerprint {
+		writePreviewConflict(c, record)
+		return
+	}
+	writePreviewReplayed(c, toRecordResponse(record))
 }
 
 // handleGetRecordByID serves the read-only lookup of any record generation, including expired

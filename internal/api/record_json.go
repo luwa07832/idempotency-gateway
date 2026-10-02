@@ -6,6 +6,8 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/luwa07832/idempotency-gateway/internal/store"
 )
 
 // marshalRecordObject renders one record with the fixed field order while embedding
@@ -74,6 +76,50 @@ func writeRecordEnvelope(c *gin.Context, record recordResponse) {
 	body = append(body, object...)
 	body = append(body, '}')
 	c.Data(http.StatusOK, "application/json; charset=utf-8", body)
+}
+
+// writePreviewCreated writes the preview observation for a key with no active record. Expired
+// historical rows are not replayed, so this is the missing-key and all-expired-key result alike.
+func writePreviewCreated(c *gin.Context) {
+	c.Data(http.StatusOK, "application/json; charset=utf-8", []byte(`{"outcome":"created"}`))
+}
+
+// writePreviewReplayed writes {"outcome":"replayed","record":{...}} with the stored record in
+// its fixed field order and the first response_snapshot embedded byte-for-byte.
+func writePreviewReplayed(c *gin.Context, record recordResponse) {
+	object, err := marshalRecordObject(record)
+	if err != nil {
+		writeStorageUnavailable(c)
+		return
+	}
+	body := make([]byte, 0, len(object)+23)
+	body = append(body, `{"outcome":"replayed","record":`...)
+	body = append(body, object...)
+	body = append(body, '}')
+	c.Data(http.StatusOK, "application/json; charset=utf-8", body)
+}
+
+// writePreviewConflict writes {"outcome":"conflict","record_id":"...","request_fingerprint":"..."}
+// from the existing active record only; its snapshot is never part of the conflict observation.
+func writePreviewConflict(c *gin.Context, record *store.Record) {
+	recordID, err := json.Marshal(record.ID)
+	if err != nil {
+		writeStorageUnavailable(c)
+		return
+	}
+	fingerprint, err := json.Marshal(record.RequestFingerprint)
+	if err != nil {
+		writeStorageUnavailable(c)
+		return
+	}
+	var body bytes.Buffer
+	body.Grow(len(recordID) + len(fingerprint) + 48)
+	body.WriteString(`{"outcome":"conflict","record_id":`)
+	body.Write(recordID)
+	body.WriteString(`,"request_fingerprint":`)
+	body.Write(fingerprint)
+	body.WriteByte('}')
+	c.Data(http.StatusOK, "application/json; charset=utf-8", body.Bytes())
 }
 
 // writeListResponse writes {"records":[...],"next_cursor":...} with every snapshot untouched.
