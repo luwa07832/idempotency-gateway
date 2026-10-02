@@ -50,13 +50,18 @@ func NewRecordID() (string, error) {
 // idempotency key at now. With an existing active record the outcome is PutReplayed when the
 // fingerprints match and PutConflict otherwise; in both cases the returned record is the stored
 // one and the candidate is not written.
+// On PutConflict one immutable idempotency_conflict_events row is committed in the same
+// transaction, carrying the candidate's raw fingerprint and the stored record's id and
+// fingerprint; a failure to persist that event makes the whole call fail instead of returning
+// PutConflict.
 //
 // The whole check-then-insert flow runs in one BEGIN IMMEDIATE transaction, and writeMu also
 // serializes writers within this instance. Across processes sharing the same file, SQLite grants
 // the RESERVED lock to only one connection at a time (peers wait on busy_timeout), so concurrent
 // submissions for one key elect exactly one visible winner: matching fingerprints all replay that
-// winner, different fingerprints only see it after the winner commits, and a re-submission once
-// every row has expired inserts one fresh row while leaving the historical rows untouched.
+// winner, different fingerprints only see it after the winner commits (each losing request leaving
+// its own conflict event), and a re-submission once every row has expired inserts one fresh row
+// while leaving the historical rows untouched.
 func (s *Store) PutRecord(ctx context.Context, candidate Record, now time.Time) (*Record, PutOutcome, error) {
 	nowNS := now.UnixNano()
 
@@ -76,6 +81,17 @@ func (s *Store) PutRecord(ctx context.Context, candidate Record, now time.Time) 
 	if existing != nil {
 		if existing.RequestFingerprint == candidate.RequestFingerprint {
 			return existing, PutReplayed, nil
+		}
+		// A fingerprint conflict is acknowledged only once the immutable audit event is committed
+		// in the same transaction: when the event cannot be stored reliably the caller must answer
+		// 503 rather than returning 409 without a durable record of the clash. BEGIN IMMEDIATE
+		// serializes conflicting requests across instances too, so every request that reaches this
+		// branch persists its own event.
+		if err := insertConflictEvent(ctx, tx, candidate, existing, now); err != nil {
+			return nil, 0, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, 0, err
 		}
 		return existing, PutConflict, nil
 	}

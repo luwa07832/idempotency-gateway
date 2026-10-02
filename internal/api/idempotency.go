@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -28,6 +27,8 @@ const (
 
 	defaultPageLimit = 50
 	maxPageLimit     = 100
+
+	limitOutOfRangeMessage = "limit must be between 1 and 100"
 )
 
 // submitRequest is the only accepted body for record submission. Times are RFC 3339 UTC strings;
@@ -143,6 +144,9 @@ func parsePageCursor(token string) (pageCursor, error) {
 func registerIdempotencyRoutes(router *gin.Engine, st *store.Store) {
 	router.POST("/v1/idempotency/records", func(c *gin.Context) {
 		handleSubmit(c, st)
+	})
+	router.GET("/v1/idempotency/conflicts", func(c *gin.Context) {
+		handleListConflicts(c, st)
 	})
 	router.GET("/v1/idempotency/history", func(c *gin.Context) {
 		handleListHistory(c, st)
@@ -458,7 +462,7 @@ func parseQueryLimit(c *gin.Context, raw string) (int, bool) {
 		}
 	}
 	if limit < 1 || limit > maxPageLimit {
-		writeInvalidRecord(c, fmt.Sprintf("limit must be between 1 and %d", maxPageLimit))
+		writeInvalidRecord(c, limitOutOfRangeMessage)
 		return 0, false
 	}
 	return limit, true
