@@ -51,6 +51,12 @@ func NewRecordID() (string, error) {
 // fingerprints match and PutConflict otherwise; in both cases the returned record is the stored
 // one and the candidate is not written.
 //
+// On PutConflict an immutable conflict event is inserted in the same transaction before commit:
+// the event stores the candidate's fingerprint as the observed value and the existing record's id
+// and fingerprint as the collided-with values. Because the insert and the conflict decision share
+// one BEGIN IMMEDIATE transaction, a commit failure surfaces as a plain error and the caller must
+// answer storage_unavailable rather than 409; no event is ever written for creates or replays.
+//
 // The whole check-then-insert flow runs in one BEGIN IMMEDIATE transaction, and writeMu also
 // serializes writers within this instance. Across processes sharing the same file, SQLite grants
 // the RESERVED lock to only one connection at a time (peers wait on busy_timeout), so concurrent
@@ -76,6 +82,26 @@ func (s *Store) PutRecord(ctx context.Context, candidate Record, now time.Time) 
 	if existing != nil {
 		if existing.RequestFingerprint == candidate.RequestFingerprint {
 			return existing, PutReplayed, nil
+		}
+		conflictID, err := NewConflictID()
+		if err != nil {
+			return nil, 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO idempotency_conflicts
+	(id, idempotency_key, observed_request_fingerprint, existing_record_id, existing_request_fingerprint, created_at_ns)
+VALUES (?, ?, ?, ?, ?, ?)`,
+			conflictID,
+			candidate.IdempotencyKey,
+			candidate.RequestFingerprint,
+			existing.ID,
+			existing.RequestFingerprint,
+			nowNS,
+		); err != nil {
+			return nil, 0, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, 0, err
 		}
 		return existing, PutConflict, nil
 	}

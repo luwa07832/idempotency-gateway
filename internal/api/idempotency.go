@@ -147,6 +147,9 @@ func registerIdempotencyRoutes(router *gin.Engine, st *store.Store) {
 	router.GET("/v1/idempotency/history", func(c *gin.Context) {
 		handleListHistory(c, st)
 	})
+	router.GET("/v1/idempotency/conflicts", func(c *gin.Context) {
+		handleListConflicts(c, st)
+	})
 	router.GET("/v1/idempotency/records/:key", func(c *gin.Context) {
 		handleGetRecord(c, st)
 	})

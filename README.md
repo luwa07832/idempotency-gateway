@@ -64,7 +64,7 @@ go run .
 
 - 首次提交：HTTP 200，返回 `{"record":{...}}`，`id` 形如 `rec_` 加 32 个小写十六进制字符。
 - 幂等键相同且请求指纹一致（记录未过期）：HTTP 200，逐字节返回第一次保存的响应快照与同一记录标识，不产生第二条可见记录。
-- 幂等键相同但请求指纹不同：HTTP 409，返回顶层 `error`，其中 `code` 为 `idempotency_fingerprint_conflict`，并带固定顺序的 `record_id` 与 `request_fingerprint`（已有记录的），原记录保持不变。
+- 幂等键相同但请求指纹不同：HTTP 409，返回顶层 `error`，其中 `code` 为 `idempotency_fingerprint_conflict`，并带固定顺序的 `record_id` 与 `request_fingerprint`（已有记录的），原记录保持不变。与此同时在同一事务内保存一条不可变冲突事件（见 `GET /v1/idempotency/conflicts`）：事件的两个指纹分别是本次请求的原始值与既有有效记录的值。只有确认事件落库后才返回 409；冲突已识别但事件无法可靠保存时返回 HTTP 503、`code` 为 `storage_unavailable`，绝不返回 409。首次创建、同指纹回放、过期后重提与校验失败均不产生事件。
 - 幂等键为空、请求指纹为空、`expires_at` 缺失或无法解析、或 `expires_at` 不严格晚于当前时刻（相等或更早）：HTTP 400，`code` 为 `invalid_idempotency_record`，不写入记录。`response_snapshot` 省略时按 `null` 存储，但必须是合法 JSON。
 
 成功响应（首次提交与回放）除 JSON 响应体外还带两个响应头：
@@ -120,9 +120,25 @@ go run .
 
 结果按 `created_at` 倒序、同刻按 `id` 倒序，响应信封为 `{"records":[...],"next_cursor":""}`，`next_cursor` 为空表示没有下一页。未知键、无匹配记录或筛选后为空都返回 HTTP 200、空 `records` 与空 `next_cursor`，不创建占位数据。游标无法解码、缺少字段、`id` 形态异常或不指向符合本查询条件的历史记录时，返回 HTTP 400，`code` 为 `invalid_cursor`；其他输入错误使用 `invalid_idempotency_record`。键集游标在翻页期间对新插入、新过期或并发变化保持稳定：已取得的页不会重复或错位。
 
+### `GET /v1/idempotency/conflicts`
+
+指纹冲突审计查询，只读返回提交入口保存的不可变冲突事件。当提交对当前有效的同一幂等键识别出不同的 `request_fingerprint` 时，会在识别冲突的同一个 `BEGIN IMMEDIATE` 事务内插入一条事件，因此每个返回 409 的请求各产生一条事件；事件只增不改、不可更新或删除，也不经提交、按键读取、按标识读取、记录列表或历史入口泄露，事件本身不包含任何响应快照。
+
+事件对象的字段与顺序固定为：`id`、`idempotency_key`、`observed_request_fingerprint`、`existing_record_id`、`existing_request_fingerprint`、`created_at`。其中 `id` 形如 `con_` 加 32 个小写十六进制字符；`observed_request_fingerprint` 保存本次冲突请求携带的原始指纹，`existing_record_id` 与 `existing_request_fingerprint` 分别指向被撞上的既有有效记录的标识与其指纹；`created_at` 为 RFC 3339 UTC 字符串。
+
+| 查询参数 | 说明 |
+|---|---|
+| `key` | 按 `idempotency_key` 原值逐字符精确匹配，不做大小写折叠、修剪或前缀匹配；省略或空字符串不筛选，空白是真实筛选值 |
+| `observed_request_fingerprint` | 按本次请求指纹原值逐字符精确匹配；空值不筛选，空白是真实筛选值 |
+| `existing_record_id` | 按既有记录标识原值逐字符精确匹配；空值不筛选，不存在的标识返回空页而非错误 |
+| `limit` | 每页条数，只接受 1–100 的十进制整数，默认 50；其他取值返回 HTTP 400，`code` 为 `invalid_conflict_query` |
+| `cursor` | 不透明键集分页游标（上一页末条事件的 `created_at` 与 `id`）；无法解码、缺少字段、`id` 形态异常或不指向符合当前筛选条件的事件时返回 HTTP 400，`code` 为 `invalid_cursor` |
+
+结果按 `created_at` 倒序、同刻按 `id` 倒序，响应信封为 `{"events":[...],"next_cursor":""}`，`next_cursor` 为空表示没有下一页。无匹配（含未知键、未知指纹、未知既有记录标识）返回 HTTP 200、空 `events` 与空 `next_cursor`。存储不可用时返回 HTTP 503、`code` 为 `storage_unavailable`。键集游标在翻页期间对新到达的冲突事件保持稳定：已取得的页不会重复或错位。
+
 ## 错误约定
 
-所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。指纹冲突结果同样以顶层 `error` 呈现，并在其后固定附带 `record_id` 与 `request_fingerprint`。存储不可用时所有幂等入口返回 HTTP 503，`code` 为 `storage_unavailable`。
+所有错误响应都是单个顶层 `error` 对象，包含 `code` 与 `message` 两个字符串字段；`message` 不包含 SQL、堆栈或文件路径。指纹冲突结果同样以顶层 `error` 呈现，并在其后固定附带 `record_id` 与 `request_fingerprint`。存储不可用时所有幂等入口返回 HTTP 503，`code` 为 `storage_unavailable`；指纹冲突的事件保存同样适用这一约定——事件无法随冲突决策一起可靠提交时返回 503 而不是 409。冲突审计查询的查询参数不合法时使用 `invalid_conflict_query`，其分页游标非法时使用 `invalid_cursor`。
 
 ## 多实例并发语义
 
@@ -133,11 +149,15 @@ go run .
   `Idempotency-Outcome` 为 `created`，其余均为 `replayed`，最终只有一条未过期记录可见。
 - 请求指纹不同：只有最先提交成功的请求返回 HTTP 200，其余返回 HTTP 409，顶层
   `error.code` 为 `idempotency_fingerprint_conflict`，并固定回传获胜记录的 `record_id`
-  与 `request_fingerprint`；后到请求不会覆盖首次快照。
+  与 `request_fingerprint`；后到请求不会覆盖首次快照。每个返回 409 的请求都在同一写事务内
+  各产生一条不可变冲突事件，事件同时记录本次指纹与获胜记录的标识及指纹；事件插入或事务
+  提交失败时该请求返回 503 `storage_unavailable`，不会出现“返回了 409 但事件缺失”。
 - 记录过期后并发重提：只新增一条记录，获胜记录之后的请求回放它；新旧行都保留在底层历史
   表中，不删除、不改写、不合并，查询与列表始终只暴露未过期记录。
 - 过期审计入口 `GET /v1/idempotency/history` 为只读查询：多实例共享 `DB_PATH` 时各实例都能
   看到同样的历史代际，但它不写入任何行，未过期记录的隔离、首次快照不可变与历史行不物理
   删除的语义都不受影响。
+- 冲突审计入口 `GET /v1/idempotency/conflicts` 同样为只读查询，各实例看到同一份只增不改的
+  冲突事件序列；事件由提交事务原子写入，查询本身不插入、不改写、不删除任何行。
 - 锁等待超过 `busy_timeout`、数据库无法读写或提交结果无法确认时，所有入口（含
   `records-by-id`）返回 HTTP 503，`code` 为 `storage_unavailable`，错误信息不泄露 SQL 细节。
