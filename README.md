@@ -76,6 +76,36 @@ go run .
 
 指纹冲突（409）、校验失败（400）与存储不可用（503）的响应都不带这两个响应头；响应体本身的形态与字节在引入响应头前后保持不变，回放仍逐字节返回首次 `response_snapshot`。
 
+### `POST /v1/idempotency/reservations`
+
+创建执行占位（pending 占位），让结果尚未产生时同键同指纹的请求复用同一个占位而不是重复执行业务。请求体：
+
+```json
+{
+  "idempotency_key": "order-123",
+  "request_fingerprint": "sha256:9c28...",
+  "expires_at": "2026-10-01T12:00:00Z"
+}
+```
+
+- 首个请求：HTTP 201，直接返回占位对象（无外层信封），字段与顺序固定为 `id`、`idempotency_key`、`request_fingerprint`、`status`（恒为 `pending`）、`created_at`、`expires_at`；`id` 形如 `res_` 加 32 个小写十六进制字符，占位没有 `response_snapshot` 字段。
+- 同键同指纹且占位未过期：HTTP 200，返回与首次完全相同的占位对象与 `id`，不创建第二个占位。
+- 同键异指纹（占位仍 pending 且未过期）：HTTP 409，顶层 `error.code` 为 `idempotency_fingerprint_conflict`，并附已有占位的 `reservation_id` 与 `request_fingerprint`，原占位保持不变。
+- `idempotency_key` 或 `request_fingerprint` 为空、`expires_at` 缺失、不是 RFC 3339 时间或不严格晚于创建时刻（相等也算）：HTTP 400，`code` 为 `invalid_idempotency_record`，不写入任何占位。
+- 成功响应带 `Idempotency-Outcome` 头：首次为 `created`，复用为 `replayed`。409、400、503 不带该头。
+
+### `POST /v1/idempotency/reservations/:reservation_id/results`
+
+提交占位的首个执行结果。请求体为 `request_fingerprint` 与 `response_snapshot`（省略快照按 `null` 存储，但必须是合法 JSON，回放逐字节保留首次字节）：
+
+- 首个结果：把占位提升为既有记录，HTTP 200 返回 `{"record":{...}}`，记录字段顺序、状态语义与 `POST /v1/idempotency/records` 完全一致；记录 `id` 为新的 `rec_` 标识，`created_at` 与 `expires_at` 沿用占位（不使用提交时刻），因此正常列表与过期历史都会自然包含这条记录。响应头 `Idempotency-Outcome` 为 `created`，并带 `Idempotency-Record-ID`。
+- 重复结果提交：HTTP 200 逐字节回放首个记录值，`Idempotency-Outcome` 为 `replayed`，`Idempotency-Record-ID` 为首次记录的同一 `id`。
+- 指纹与占位不符：HTTP 409，`code` 为 `idempotency_fingerprint_conflict`，并附 `reservation_id` 与占位的 `request_fingerprint`，占位不被提升、首个结果不受影响。
+- `reservation_id` 不是 `res_` 加恰好 32 个小写十六进制字符，或请求体本身非法：HTTP 400，`code` 为 `invalid_idempotency_record`。
+- 形态合法但不存在的占位：HTTP 404，`code` 为 `not_found`。
+- 占位已到 `expires_at` 仍无结果：占位视为 expired，结果提交返回 HTTP 409，`code` 为 `idempotency_reservation_expired`，附 `reservation_id` 与 `request_fingerprint`；此后同键可以创建新的占位，旧占位不阻塞。
+- 存储故障：HTTP 503，`code` 为 `storage_unavailable`；整个检查与提升在单事务内完成，失败不产生部分写入（不留下无快照记录或半个占位状态）。
+
 ### `GET /v1/idempotency/records/:idempotency_key`
 
 按键查询，成功返回 `{"record":{...}}`。键不存在或记录已过期时统一返回 HTTP 404，`code` 为 `not_found`，不返回历史响应快照，也不会自动创建占位记录。
@@ -134,6 +164,11 @@ go run .
 - 请求指纹不同：只有最先提交成功的请求返回 HTTP 200，其余返回 HTTP 409，顶层
   `error.code` 为 `idempotency_fingerprint_conflict`，并固定回传获胜记录的 `record_id`
   与 `request_fingerprint`；后到请求不会覆盖首次快照。
+- 执行占位与结果：多实例并发为同一幂等键创建占位时，只有一个请求返回 HTTP 201 且
+  `Idempotency-Outcome` 为 `created`，其余同指纹请求 HTTP 200 复用同一 `res_` 标识并标
+  `replayed`，异指纹请求 HTTP 409；并发提交同一占位的首个结果时只有一个请求把占位提升为
+  `rec_` 记录并标 `created`，其余全部回放该首次记录并标 `replayed`，最终只有一条占位与一条
+  结果记录可见。占位过期后同键允许创建新占位，已提升的记录仍按既有过期规则进入历史。
 - 记录过期后并发重提：只新增一条记录，获胜记录之后的请求回放它；新旧行都保留在底层历史
   表中，不删除、不改写、不合并，查询与列表始终只暴露未过期记录。
 - 过期审计入口 `GET /v1/idempotency/history` 为只读查询：多实例共享 `DB_PATH` 时各实例都能

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,15 +49,74 @@ func Open(path string) (*Store, error) {
 	}
 	// DDL runs as a deferred transaction, so several instances starting on a fresh file at the same
 	// moment can observe SQLITE_BUSY/LOCKED despite busy_timeout; retry the idempotent CREATE
-	// statements briefly instead of failing startup.
+	// statements briefly instead of failing startup. Statements run one at a time because the
+	// reservation partial index requires the migrated column to exist on a legacy database.
 	if err := execWithBusyRetry(func() error {
-		_, err := db.Exec(schema)
-		return err
+		for _, statement := range schemaStatements {
+			if _, err := db.Exec(statement); err != nil {
+				return err
+			}
+		}
+		return nil
 	}); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	// Databases created before reservations existed lack records.reservation_id; add it once so
+	// both old files and fresh databases share the same shape. The DEFAULT lets ALTER TABLE add a
+	// NOT NULL column on a table that already holds rows.
+	if err := ensureColumn(db, "idempotency_records", "reservation_id",
+		`TEXT NOT NULL DEFAULT ''`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
+	if err := execWithBusyRetry(func() error {
+		_, err := db.Exec(schemaReservationRecordIndex)
+		return err
+	}); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// ensureColumn adds column to table with the given column definition when the table does not have
+// a column of that name yet. The check is a PRAGMA read inside the same write lock SQLite grants
+// for schema changes; the migration only ever runs identifiers fixed in this source file.
+func ensureColumn(db *sql.DB, table, column, definition string) error {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			ctype     string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dfltValue, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if found {
+		return nil
+	}
+	_, err = db.Exec(fmt.Sprintf(
+		"ALTER TABLE %s ADD COLUMN %s %s", table, column, strings.TrimSpace(definition)))
+	return err
 }
 
 // execWithBusyRetry retries op while SQLite reports the database is busy or locked.
@@ -92,24 +152,38 @@ func (s *Store) Ping() error { return s.db.Ping() }
 // Close releases the database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
-const schema = `
-CREATE TABLE IF NOT EXISTS service_metadata (
+// schemaStatements are the idempotent CREATE statements run on every Open. The reservation
+// unique partial index is separate (schemaReservationRecordIndex): it requires the migrated
+// reservation_id column, so it must run after ensureColumn on a legacy database.
+var schemaStatements = []string{
+	`CREATE TABLE IF NOT EXISTS service_metadata (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS idempotency_records (
+)`,
+	`CREATE TABLE IF NOT EXISTS idempotency_records (
 	id                  TEXT PRIMARY KEY,
 	idempotency_key     TEXT NOT NULL,
 	request_fingerprint TEXT NOT NULL,
 	response_snapshot   TEXT NOT NULL,
 	created_at_ns       INTEGER NOT NULL,
+	expires_at_ns       INTEGER NOT NULL,
+	reservation_id      TEXT NOT NULL DEFAULT ''
+)`,
+	`CREATE INDEX IF NOT EXISTS idx_idempotency_records_key
+	ON idempotency_records (idempotency_key, created_at_ns DESC, id DESC)`,
+	`CREATE INDEX IF NOT EXISTS idx_idempotency_records_list
+	ON idempotency_records (expires_at_ns, created_at_ns DESC, id DESC)`,
+	`CREATE TABLE IF NOT EXISTS idempotency_reservations (
+	id                  TEXT PRIMARY KEY,
+	idempotency_key     TEXT NOT NULL,
+	request_fingerprint TEXT NOT NULL,
+	created_at_ns       INTEGER NOT NULL,
 	expires_at_ns       INTEGER NOT NULL
-);
+)`,
+	`CREATE INDEX IF NOT EXISTS idx_idempotency_reservations_key
+	ON idempotency_reservations (idempotency_key, created_at_ns DESC, id DESC)`,
+}
 
-CREATE INDEX IF NOT EXISTS idx_idempotency_records_key
-	ON idempotency_records (idempotency_key, created_at_ns DESC, id DESC);
-
-CREATE INDEX IF NOT EXISTS idx_idempotency_records_list
-	ON idempotency_records (expires_at_ns, created_at_ns DESC, id DESC);
-`
+const schemaReservationRecordIndex = `
+CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency_records_reservation
+	ON idempotency_records (reservation_id) WHERE reservation_id <> ''`
