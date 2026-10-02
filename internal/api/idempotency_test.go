@@ -409,3 +409,148 @@ func TestSubmitRejectsExpiryNotStrictlyAfterNow(t *testing.T) {
 		t.Fatalf("validated request = %+v", validated)
 	}
 }
+
+func TestSubmitOutcomeAndRecordIDHeaders(t *testing.T) {
+	handler := newAPIRouter(t)
+
+	created := doJSON(t, handler, http.MethodPost, "/v1/idempotency/records", submitBody("hdr", "fp", `{"price":100}`, ""))
+	if created.Code != http.StatusOK {
+		t.Fatalf("create status = %d body = %s", created.Code, created.Body.String())
+	}
+	if got := created.Header().Get("Idempotency-Outcome"); got != "created" {
+		t.Fatalf("create outcome header = %q, want created", got)
+	}
+	var createdParsed struct {
+		Record struct {
+			ID string `json:"id"`
+		} `json:"record"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &createdParsed); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := created.Header().Get("Idempotency-Record-ID"); got != createdParsed.Record.ID {
+		t.Fatalf("create record id header = %q, want %s", got, createdParsed.Record.ID)
+	}
+
+	replayed := doJSON(t, handler, http.MethodPost, "/v1/idempotency/records", submitBody("hdr", "fp", `{"price":999}`, ""))
+	if replayed.Code != http.StatusOK {
+		t.Fatalf("replay status = %d", replayed.Code)
+	}
+	if got := replayed.Header().Get("Idempotency-Outcome"); got != "replayed" {
+		t.Fatalf("replay outcome header = %q, want replayed", got)
+	}
+	if got := replayed.Header().Get("Idempotency-Record-ID"); got != createdParsed.Record.ID {
+		t.Fatalf("replay record id header = %q, want %s", got, createdParsed.Record.ID)
+	}
+
+	conflict := doJSON(t, handler, http.MethodPost, "/v1/idempotency/records", submitBody("hdr", "fp-other", `{}`, ""))
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("conflict status = %d", conflict.Code)
+	}
+	if got := conflict.Header().Get("Idempotency-Outcome"); got != "" {
+		t.Fatalf("conflict carried outcome header %q", got)
+	}
+	if got := conflict.Header().Get("Idempotency-Record-ID"); got != "" {
+		t.Fatalf("conflict carried record id header %q", got)
+	}
+
+	invalid := doJSON(t, handler, http.MethodPost, "/v1/idempotency/records", `{}`)
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid status = %d", invalid.Code)
+	}
+	if got := invalid.Header().Get("Idempotency-Outcome"); got != "" {
+		t.Fatalf("validation error carried outcome header %q", got)
+	}
+	if got := invalid.Header().Get("Idempotency-Record-ID"); got != "" {
+		t.Fatalf("validation error carried record id header %q", got)
+	}
+}
+
+func TestGetRecordByIDActiveAndExpired(t *testing.T) {
+	st, handler := historyRouterWithStore(t)
+	now := time.Now().UTC()
+	seeded := seedHistoryHTTPRows(t, st, now)
+
+	first := seeded[0] // expired generation, snapshot keeps odd whitespace
+	response := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records-by-id/"+first.ID, "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("expired generation status = %d body = %s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.HasPrefix(body, `{"record":{"id":"`+first.ID+`"`) {
+		t.Fatalf("by-id body shape: %s", body)
+	}
+	if !strings.Contains(body, `"status":"expired"`) {
+		t.Fatalf("expired generation must report expired: %s", body)
+	}
+	if !strings.Contains(body, `"response_snapshot":{"v":"first" }`) {
+		t.Fatalf("snapshot bytes were not preserved: %s", body)
+	}
+
+	active := seeded[3] // future row
+	activeResponse := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records-by-id/"+active.ID, "")
+	if activeResponse.Code != http.StatusOK {
+		t.Fatalf("active generation status = %d body = %s", activeResponse.Code, activeResponse.Body.String())
+	}
+	if !strings.Contains(activeResponse.Body.String(), `"status":"active"`) {
+		t.Fatalf("active generation must report active: %s", activeResponse.Body.String())
+	}
+
+	// The by-id entry is read-only: seeded[2] is the only generation for "other" and is expired,
+	// and the key-based entry must keep hiding it.
+	other := seeded[2]
+	if other := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records-by-id/"+other.ID, ""); other.Code != http.StatusOK {
+		t.Fatalf("other generation status = %d", other.Code)
+	}
+	if hidden := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records/other", ""); hidden.Code != http.StatusNotFound {
+		t.Fatalf("read-only by-id lookup changed key visibility: %d", hidden.Code)
+	}
+}
+
+func TestGetRecordByIDInvalidAndMissing(t *testing.T) {
+	handler := newAPIRouter(t)
+	for _, recordID := range []string{
+		"rec_",
+		"rec_xyz",
+		"rec_0000000000000000000000000000000",   // 31 hex chars
+		"rec_000000000000000000000000000000000", // 33 hex chars
+		"REC_00000000000000000000000000000001",  // uppercase prefix
+		"rec_0000000000000000000000000000000A",  // uppercase hex
+		"rec_0000000000000000000000000000000z",  // non-hex suffix
+		"00000000000000000000000000000001",      // missing prefix
+	} {
+		response := doJSON(t, handler, http.MethodGet, "/v1/idempotency/records-by-id/"+recordID, "")
+		if response.Code != http.StatusBadRequest ||
+			!strings.HasPrefix(response.Body.String(), `{"error":{"code":"invalid_idempotency_record",`) {
+			t.Fatalf("record id %q = %d %s", recordID, response.Code, response.Body.String())
+		}
+	}
+
+	missing := doJSON(t, handler, http.MethodGet,
+		"/v1/idempotency/records-by-id/rec_00000000000000000000000000000001", "")
+	if missing.Code != http.StatusNotFound ||
+		!strings.HasPrefix(missing.Body.String(), `{"error":{"code":"not_found",`) {
+		t.Fatalf("well-formed missing id = %d %s", missing.Code, missing.Body.String())
+	}
+}
+
+func TestGetRecordByIDStorageUnavailable(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "service.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	handler := NewRouter(st)
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	response := doJSON(t, handler, http.MethodGet,
+		"/v1/idempotency/records-by-id/rec_00000000000000000000000000000001", "")
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.HasPrefix(response.Body.String(), `{"error":{"code":"storage_unavailable",`) {
+		t.Fatalf("closed store = %d %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "sql:") {
+		t.Fatalf("storage detail leaked: %s", response.Body.String())
+	}
+}

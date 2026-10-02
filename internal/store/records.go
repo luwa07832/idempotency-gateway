@@ -105,6 +105,25 @@ func (s *Store) ActiveRecordByKey(ctx context.Context, key string, now time.Time
 	return queryActiveRecord(ctx, s.db, key, now.UnixNano())
 }
 
+const recordByIDQuery = `
+SELECT id, idempotency_key, request_fingerprint, response_snapshot, created_at_ns, expires_at_ns
+FROM idempotency_records
+WHERE id = ?`
+
+// RecordByID returns the record with id regardless of its expiry state, so the read-only
+// by-id entry can surface every generation the history table keeps. Rows are never physically
+// deleted, so a previously seen id stays resolvable; a missing id yields (nil, nil).
+func (s *Store) RecordByID(ctx context.Context, id string) (*Record, error) {
+	record, err := scanRecord(s.db.QueryRowContext(ctx, recordByIDQuery, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return record, nil
+}
+
 // ListFilter narrows ListRecords. Zero-valued fields are not applied.
 type ListFilter struct {
 	IdempotencyKey     string

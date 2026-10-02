@@ -38,7 +38,7 @@ type HistoryFilter struct {
 // append to pages the client has not reached yet.
 func (s *Store) ListHistoryRecords(ctx context.Context, filter HistoryFilter, now time.Time) ([]Record, error) {
 	if filter.CursorID != "" {
-		if !isRecordID(filter.CursorID) {
+		if !IsRecordID(filter.CursorID) {
 			return nil, ErrInvalidID
 		}
 		if err := s.validateHistoryCursor(ctx, filter, now); err != nil {
@@ -131,9 +131,9 @@ WHERE id = ? AND idempotency_key = ? AND expires_at_ns <= ?`
 	return err
 }
 
-// isRecordID reports whether id has the fixed shape NewRecordID emits: "rec_" followed by
+// IsRecordID reports whether id has the fixed shape NewRecordID emits: "rec_" followed by
 // exactly 32 lowercase hexadecimal characters.
-func isRecordID(id string) bool {
+func IsRecordID(id string) bool {
 	const (
 		prefix = "rec_"
 		hexLen = 32

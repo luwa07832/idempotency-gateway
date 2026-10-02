@@ -346,3 +346,128 @@ func TestCrossInstancesHistoryAuditIsReadOnlyAcrossInstances(t *testing.T) {
 		t.Fatalf("unknown key created placeholder data: %s", missing.Body.String())
 	}
 }
+
+// TestCrossInstancesHTTPSameFingerprintHeaders verifies that racing identical submissions share
+// one record id and split the outcome headers exactly: one created, every other replayed.
+func TestCrossInstancesHTTPSameFingerprintHeaders(t *testing.T) {
+	const instances = 6
+	routers, _ := newSharedRouters(t, instances)
+	body := submitBody("race-headers", "fp", `{"price":100}`, "")
+
+	type result struct {
+		status   int
+		respBody string
+		outcome  string
+		recordID string
+	}
+	results := make([]result, instances)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, router := range routers {
+		wg.Add(1)
+		go func(i int, router http.Handler) {
+			defer wg.Done()
+			<-start
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/v1/idempotency/records", bytes.NewBufferString(body))
+			request.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(recorder, request)
+			results[i] = result{
+				status:   recorder.Code,
+				respBody: recorder.Body.String(),
+				outcome:  recorder.Header().Get("Idempotency-Outcome"),
+				recordID: recorder.Header().Get("Idempotency-Record-ID"),
+			}
+		}(i, router)
+	}
+	close(start)
+	wg.Wait()
+
+	created, replayed := 0, 0
+	winnerID := ""
+	for i, r := range results {
+		if r.status != http.StatusOK {
+			t.Fatalf("instance %d status = %d body = %s", i, r.status, r.respBody)
+		}
+		if winnerID == "" {
+			winnerID = r.recordID
+		}
+		if r.recordID != winnerID {
+			t.Fatalf("instance %d record id header = %q, want %q", i, r.recordID, winnerID)
+		}
+		switch r.outcome {
+		case "created":
+			created++
+		case "replayed":
+			replayed++
+		default:
+			t.Fatalf("instance %d unexpected outcome header %q", i, r.outcome)
+		}
+	}
+	if created != 1 || replayed != instances-1 {
+		t.Fatalf("created = %d replayed = %d, want 1 and %d", created, replayed, instances-1)
+	}
+}
+
+// TestCrossInstancesHTTPConflictHasNoOutcomeHeaders verifies losing racers do not get the
+// outcome/record-id headers even though all instances share one database file.
+func TestCrossInstancesHTTPConflictHasNoOutcomeHeaders(t *testing.T) {
+	const instances = 5
+	routers, _ := newSharedRouters(t, instances)
+	bodies := make([]string, instances)
+	for i := range bodies {
+		bodies[i] = submitBodyWithFingerprint("race-conflict-headers", "fp-"+string(rune('a'+i)))
+	}
+
+	type result struct {
+		status   int
+		respBody string
+		outcome  string
+		recordID string
+	}
+	results := make([]result, instances)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, router := range routers {
+		wg.Add(1)
+		go func(i int, router http.Handler) {
+			defer wg.Done()
+			<-start
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/v1/idempotency/records", bytes.NewBufferString(bodies[i]))
+			request.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(recorder, request)
+			results[i] = result{
+				status:   recorder.Code,
+				respBody: recorder.Body.String(),
+				outcome:  recorder.Header().Get("Idempotency-Outcome"),
+				recordID: recorder.Header().Get("Idempotency-Record-ID"),
+			}
+		}(i, router)
+	}
+	close(start)
+	wg.Wait()
+
+	winners := 0
+	for i, r := range results {
+		switch r.status {
+		case http.StatusOK:
+			winners++
+			if r.outcome != "created" {
+				t.Fatalf("instance %d winner outcome = %q, want created", i, r.outcome)
+			}
+		case http.StatusConflict:
+			if r.outcome != "" {
+				t.Fatalf("instance %d loser carried outcome header %q", i, r.outcome)
+			}
+			if r.recordID != "" {
+				t.Fatalf("instance %d loser carried record id header %q", i, r.recordID)
+			}
+		default:
+			t.Fatalf("instance %d unexpected status %d body %s", i, r.status, r.respBody)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("winners = %d, want exactly 1", winners)
+	}
+}

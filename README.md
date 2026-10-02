@@ -62,14 +62,23 @@ go run .
 }
 ```
 
-- 首次提交：HTTP 200，返回 `{"record":{...}}`，`id` 形如 `rec_` 加 32 个小写十六进制字符。
-- 幂等键相同且请求指纹一致（记录未过期）：HTTP 200，逐字节返回第一次保存的响应快照与同一记录标识，不产生第二条可见记录。
+- 首次提交：HTTP 200，返回 `{"record":{...}}`，`id` 形如 `rec_` 加 32 个小写十六进制字符；响应头 `Idempotency-Outcome: created` 与 `Idempotency-Record-ID: <id>` 标识本次为首次插入。
+- 幂等键相同且请求指纹一致（记录未过期）：HTTP 200，逐字节返回第一次保存的响应快照与同一记录标识，不产生第二条可见记录；响应头为 `Idempotency-Outcome: replayed`，`Idempotency-Record-ID` 与首次一致。
 - 幂等键相同但请求指纹不同：HTTP 409，返回顶层 `error`，其中 `code` 为 `idempotency_fingerprint_conflict`，并带固定顺序的 `record_id` 与 `request_fingerprint`（已有记录的），原记录保持不变。
 - 幂等键为空、请求指纹为空、`expires_at` 缺失或无法解析、或 `expires_at` 不严格晚于当前时刻（相等或更早）：HTTP 400，`code` 为 `invalid_idempotency_record`，不写入记录。`response_snapshot` 省略时按 `null` 存储，但必须是合法 JSON。
+
+`Idempotency-Outcome` 与 `Idempotency-Record-ID` 只出现在 HTTP 200 成功响应上；409 指纹冲突、400 校验失败与 503 存储故障都不携带这两个响应头。JSON 响应体的字段、顺序与逐字节回放语义不因响应头而改变。
 
 ### `GET /v1/idempotency/records/:idempotency_key`
 
 按键查询，成功返回 `{"record":{...}}`。键不存在或记录已过期时统一返回 HTTP 404，`code` 为 `not_found`，不返回历史响应快照，也不会自动创建占位记录。
+
+### `GET /v1/idempotency/records-by-id/:record_id`
+
+按记录标识只读查询任意一代记录（包括按键读取与列表隐藏的已过期代际）。成功返回 HTTP 200 与 `{"record":{...}}`，字段沿用记录对象的固定顺序，`response_snapshot` 逐字节保留首次提交的 JSON。`status` 在查询时刻按存储的 `expires_at` 实时计算：严格晚于当前时刻为 `active`，否则为 `expired`。该入口不写入、不改写任何记录，也不改变提交、按键读取、列表与历史入口的可见结果。
+
+- `record_id` 必须是 `rec_` 加恰好 32 个小写十六进制字符；形态不合法返回 HTTP 400，顶层 `error.code` 为 `invalid_idempotency_record`。
+- 形态合法但没有对应记录（该标识从未生成过）返回 HTTP 404，顶层 `error.code` 为 `not_found`。
 
 ### `GET /v1/idempotency/records`
 
@@ -110,11 +119,14 @@ go run .
 
 多个实例共享一个数据库文件并发提交同一 `idempotency_key` 时：
 
-- 请求指纹相同：所有成功请求都返回 HTTP 200、相同的 `record.id`、逐字节一致的首次
-  `response_snapshot` 与相同的时间字段，最终只有一条未过期记录可见。
+- 请求指纹相同：所有成功请求都返回 HTTP 200、相同的 `record.id` 与相同的
+  `Idempotency-Record-ID`、逐字节一致的首次 `response_snapshot` 与相同的时间字段，最终只有
+  一条未过期记录可见；仅首次插入的请求返回 `Idempotency-Outcome: created`，其余成功请求
+  全部返回 `Idempotency-Outcome: replayed`。
 - 请求指纹不同：只有最先提交成功的请求返回 HTTP 200，其余返回 HTTP 409，顶层
   `error.code` 为 `idempotency_fingerprint_conflict`，并固定回传获胜记录的 `record_id`
-  与 `request_fingerprint`；后到请求不会覆盖首次快照。
+  与 `request_fingerprint`；后到请求不会覆盖首次快照，也不携带 `Idempotency-Outcome` 或
+  `Idempotency-Record-ID` 响应头。
 - 记录过期后并发重提：只新增一条记录，获胜记录之后的请求回放它；新旧行都保留在底层历史
   表中，不删除、不改写、不合并，查询与列表始终只暴露未过期记录。
 - 过期审计入口 `GET /v1/idempotency/history` 为只读查询：多实例共享 `DB_PATH` 时各实例都能

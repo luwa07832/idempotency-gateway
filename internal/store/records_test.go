@@ -357,3 +357,59 @@ func TestConcurrentPutsElectSingleFirstRecord(t *testing.T) {
 		t.Fatalf("created count = %d, want exactly 1", createdCount)
 	}
 }
+
+func TestRecordByIDResolvesAnyGeneration(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 2, 10, 0, 0, 0, time.UTC)
+
+	old := makeRecord(t, "gen", "fp", `{"v":"old" }`, now.Add(-2*time.Hour), now.Add(-time.Hour))
+	if _, _, err := st.PutRecord(ctx, old, now.Add(-2*time.Hour)); err != nil {
+		t.Fatalf("seed expired: %v", err)
+	}
+	fresh := makeRecord(t, "gen", "fp", `{"v":"new"}`, now.Add(-time.Minute), now.Add(time.Hour))
+	if _, _, err := st.PutRecord(ctx, fresh, now); err != nil {
+		t.Fatalf("seed active: %v", err)
+	}
+
+	for _, want := range []Record{old, fresh} {
+		got, err := st.RecordByID(ctx, want.ID)
+		if err != nil {
+			t.Fatalf("record by id %s: %v", want.ID, err)
+		}
+		if got == nil {
+			t.Fatalf("record %s not found", want.ID)
+		}
+		if got.ID != want.ID || got.IdempotencyKey != want.IdempotencyKey {
+			t.Fatalf("got %+v, want %+v", got, want)
+		}
+		if string(got.ResponseSnapshot) != string(want.ResponseSnapshot) {
+			t.Fatalf("snapshot = %q, want %q", got.ResponseSnapshot, want.ResponseSnapshot)
+		}
+	}
+
+	missing, err := st.RecordByID(ctx, "rec_00000000000000000000000000000009")
+	if err != nil || missing != nil {
+		t.Fatalf("missing id = %+v, %v", missing, err)
+	}
+}
+
+func TestIsRecordIDShape(t *testing.T) {
+	id, err := NewRecordID()
+	if err != nil {
+		t.Fatalf("new id: %v", err)
+	}
+	if !IsRecordID(id) {
+		t.Fatalf("generated id %q rejected", id)
+	}
+	for _, bad := range []string{
+		"", "rec_", "rec_" + "0000000000000000000000000000000",
+		"rec_" + "000000000000000000000000000000000",
+		"rec_" + "0000000000000000000000000000000g",
+		"REC_" + "00000000000000000000000000000001",
+	} {
+		if IsRecordID(bad) {
+			t.Fatalf("bad id %q accepted", bad)
+		}
+	}
+}
